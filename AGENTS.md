@@ -87,7 +87,9 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
 - [~] **Web admin**: runtime symbol add/delete and refresh interval work at
       `http://<board-ip>/`. Settings load/save atomically through `ticker.cfg` on SD when a
       formatted card is available; target currently reports SD unavailable.
-- [ ] Later: pinned CA verification, WiFi as alternate netif.
+- [x] **TLS verification**: `rozakos.eu` hostname and certificate chain are verified against
+      the pinned Google Trust Services WE1 intermediate (valid through 2029-02-20).
+- [ ] Later: WiFi as alternate netif.
 
 ## 6. NEXT ACTION (start here)
 
@@ -151,6 +153,12 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-09 - Codex (GPT-5):** Enabled required TLS certificate verification. Inspected the
+  live `rozakos.eu` chain, pinned the Google Trust Services WE1 intermediate (valid through
+  2029-02-20), enabled PEM/base64 parsing, and changed the default from `VERIFY_NONE` to
+  `VERIFY_REQUIRED` with hostname checking. Built, flashed, and verified on target:
+  `[tls] pinned CA loaded; verification required`, followed by successful live quote and
+  history HTTPS requests.
 - **2026-06-09 - Codex (GPT-5):** Added persistent Web UI settings using the existing
   reentrant FatFs/SD stack. The Web task mounts SD, loads `ticker.cfg`, and successful symbol
   or refresh changes atomically replace the config through `ticker.tmp`. Missing/unformatted

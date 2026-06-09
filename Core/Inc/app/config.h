@@ -36,7 +36,7 @@
 /* ---- TLS ---------------------------------------------------------------- */
 /* 1 = skip server-cert verification (INSECURE, bring-up only).
  * 0 = verify against the pinned CA in tls_ca_cert.c (preferred). */
-#define TLS_INSECURE_SKIP_VERIFY  1
+#define TLS_INSECURE_SKIP_VERIFY  0
 
 /* ---- Console ------------------------------------------------------------ */
 /* printf() is retargeted to USART1 (ST-Link VCP) at 115200 8N1. */

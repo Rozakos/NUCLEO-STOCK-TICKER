@@ -16,6 +16,9 @@
 #include "mbedtls/memory_buffer_alloc.h"
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ssl.h"
+#include "mbedtls/x509_crt.h"
+
+#include "tls_ca_cert.c"
 
 #define TLS_HEAP_ADDR       ((unsigned char *)0xC0040000U)
 #define TLS_HEAP_SIZE       (128U * 1024U)
@@ -23,6 +26,8 @@
 #define HTTP_RESPONSE_SIZE  (24U * 1024U)
 
 static bool api_initialized;
+static bool ca_initialized;
+static mbedtls_x509_crt ca_cert;
 
 static void *json_malloc(size_t size)
 {
@@ -173,7 +178,17 @@ static int https_get(const char *path, char **body, size_t *body_len, char *erro
     format_tls_error(error, error_size, "TLS config", ret);
     goto cleanup;
   }
+#if TLS_INSECURE_SKIP_VERIFY
   mbedtls_ssl_conf_authmode(&config, MBEDTLS_SSL_VERIFY_NONE);
+#else
+  if (!ca_initialized)
+  {
+    snprintf(error, error_size, "pinned CA unavailable");
+    goto cleanup;
+  }
+  mbedtls_ssl_conf_ca_chain(&config, &ca_cert, NULL);
+  mbedtls_ssl_conf_authmode(&config, MBEDTLS_SSL_VERIFY_REQUIRED);
+#endif
   mbedtls_ssl_conf_rng(&config, mbedtls_ctr_drbg_random, &drbg);
 
   ret = mbedtls_ssl_setup(&ssl, &config);
@@ -307,6 +322,18 @@ void stock_api_init(void)
   }
 
   mbedtls_memory_buffer_alloc_init(TLS_HEAP_ADDR, TLS_HEAP_SIZE);
+  mbedtls_x509_crt_init(&ca_cert);
+  int ret = mbedtls_x509_crt_parse(&ca_cert,
+      (const unsigned char *)tls_ca_cert_pem, strlen(tls_ca_cert_pem) + 1U);
+  if (ret == 0)
+  {
+    ca_initialized = true;
+    printf("[tls] pinned CA loaded; verification required\r\n");
+  }
+  else
+  {
+    printf("[tls] pinned CA parse failed: -0x%04X\r\n", (unsigned)-ret);
+  }
   cJSON_Hooks hooks = { .malloc_fn = json_malloc, .free_fn = json_free };
   cJSON_InitHooks(&hooks);
   api_initialized = true;
