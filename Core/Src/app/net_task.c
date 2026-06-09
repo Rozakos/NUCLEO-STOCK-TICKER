@@ -32,6 +32,31 @@ static void net_wait_for_ip(void)
   printf("[net] waiting for link + DHCP...\r\n");
   for (;;)
   {
+    if (netif_is_up(&gnetif) && !ip4_addr_isany_val(*netif_ip4_addr(&gnetif)))
+    {
+      break;
+    }
+    osDelay(200);
+  }
+
+  printf("[net] DHCP bound. IP  = %s\r\n", ip4addr_ntoa(netif_ip4_addr(&gnetif)));
+  printf("[net]              GW  = %s\r\n", ip4addr_ntoa(netif_ip4_gw(&gnetif)));
+  printf("[net]              MASK= %s\r\n", ip4addr_ntoa(netif_ip4_netmask(&gnetif)));
+}
+
+void StartNetTask(void const *argument)
+{
+  (void)argument;
+  char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
+  size_t symbol_count = settings_get_symbols(symbols);
+  size_t symbol_index = 0;
+  uint32_t settings_seen = settings_generation();
+
+  net_wait_for_ip();
+  stock_api_init();
+
+  for (;;)
+  {
     history_request_t history_request;
     if (history_data_take_request(&history_request))
     {
@@ -58,31 +83,6 @@ static void net_wait_for_ip(void)
       continue;
     }
 
-    if (netif_is_up(&gnetif) && !ip4_addr_isany_val(*netif_ip4_addr(&gnetif)))
-    {
-      break;
-    }
-    osDelay(200);
-  }
-
-  printf("[net] DHCP bound. IP  = %s\r\n", ip4addr_ntoa(netif_ip4_addr(&gnetif)));
-  printf("[net]              GW  = %s\r\n", ip4addr_ntoa(netif_ip4_gw(&gnetif)));
-  printf("[net]              MASK= %s\r\n", ip4addr_ntoa(netif_ip4_netmask(&gnetif)));
-}
-
-void StartNetTask(void const *argument)
-{
-  (void)argument;
-  char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
-  size_t symbol_count = settings_get_symbols(symbols);
-  size_t symbol_index = 0;
-  uint32_t settings_seen = settings_generation();
-
-  net_wait_for_ip();
-  stock_api_init();
-
-  for (;;)
-  {
     if (settings_generation() != settings_seen)
     {
       symbol_count = settings_get_symbols(symbols);

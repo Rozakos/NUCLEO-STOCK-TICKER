@@ -606,16 +606,21 @@ void StartUiTask(void const *argument)
 {
   (void)argument;
 
+  printf("[ui] initializing LVGL\r\n");
   lv_init();
   lv_tick_set_cb(HAL_GetTick);
+  printf("[ui] creating display\r\n");
   lv_display_t *display = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
   lv_display_set_color_format(display, LV_COLOR_FORMAT_RGB565);
   /* Clear the second framebuffer so the first flip can't show garbage. */
+  printf("[ui] clearing second framebuffer\r\n");
   memset(FRAMEBUFFER_1, 0, FRAMEBUFFER_SIZE);
+  printf("[ui] configuring display buffers\r\n");
   lv_display_set_buffers(display, FRAMEBUFFER_0, FRAMEBUFFER_1,
                          FRAMEBUFFER_SIZE, LV_DISPLAY_RENDER_MODE_DIRECT);
   lv_display_set_flush_cb(display, display_flush);
 
+  printf("[ui] creating market screen\r\n");
   create_market_screen();
   touch_ft5336_init();
   printf("[display] CYD-style markets list active\r\n");

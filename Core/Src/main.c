@@ -214,7 +214,7 @@ int main(void)
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 4096);
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 1024);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
@@ -1601,19 +1601,26 @@ void StartDefaultTask(void const * argument)
   /* init code for LWIP */
   MX_LWIP_Init();
   /* USER CODE BEGIN 5 */
-  printf("\r\n[boot] NUCLEO-STOCK-TICKER: LwIP up, starting net task\r\n");
+  printf("\r\n[boot] NUCLEO-STOCK-TICKER: LwIP up, starting app tasks\r\n");
 
-  /* TLS handshakes use a deep call stack on Cortex-M7. */
-  osThreadDef(netTask, StartNetTask, osPriorityNormal, 0, 4096);
-  osThreadCreate(osThread(netTask), NULL);
-
-  osThreadDef(uiTask, StartUiTask, osPriorityNormal, 0, 2048);
-  osThreadCreate(osThread(uiTask), NULL);
+  /* Start the UI before network logging can contend for the UART console. */
+  osThreadDef(uiTask, StartUiTask, osPriorityAboveNormal, 0, 2048);
+  osThreadId ui_task = osThreadCreate(osThread(uiTask), NULL);
 
   /* 2048 words: handle_client (request[1536]) nests append_symbols_page
    * (form[2300] + row buffers) ~4.1 KB of stack buffers; 1024 overflowed. */
   osThreadDef(webTask, StartWebTask, osPriorityBelowNormal, 0, 2048);
-  osThreadCreate(osThread(webTask), NULL);
+  osThreadId web_task = osThreadCreate(osThread(webTask), NULL);
+
+  /* TLS handshakes use a deep call stack on Cortex-M7. */
+  osThreadDef(netTask, StartNetTask, osPriorityNormal, 0, 4096);
+  osThreadId net_task = osThreadCreate(osThread(netTask), NULL);
+
+  if (ui_task == NULL || web_task == NULL || net_task == NULL)
+  {
+    printf("[fatal] app task creation failed\r\n");
+    Error_Handler();
+  }
 
   /* Infinite loop */
   for(;;)

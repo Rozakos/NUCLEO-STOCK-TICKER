@@ -84,7 +84,9 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
       admin up to APP_MAX_SYMBOLS=8). Tapping any row opens a detail screen (AMD shows its logo;
       others show a brand-colored initial badge) with a full-width chart and range buttons that
       asynchronously fetch real `/history/{symbol}?range=...` data via the serialized TLS task.
-- [ ] Later: web admin (LwIP httpd + settings on SD), WiFi as alternate netif.
+- [~] **Web admin**: runtime symbol add/delete and refresh interval work at
+      `http://<board-ip>/`. Settings are not persisted across reset yet.
+- [ ] Later: persistent settings on SD, pinned CA verification, WiFi as alternate netif.
 
 ## 6. NEXT ACTION (start here)
 
@@ -147,6 +149,15 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 - Many Disco peripherals are enabled but unused (DCMI/SAI/SPDIF/QSPI/USB host) — ignore them.
 
 ## 8. Session log
+
+- **2026-06-09 - Codex (GPT-5):** Restored stable startup after the logo commit caused
+  `lv_display_create()` to hang on the first allocation from an external-SDRAM LVGL heap.
+  Returned LVGL to its proven internal 64 KiB heap and disabled lodepng until the SDRAM
+  allocator path is reliable. Reduced the idle default-task stack, starts the UI before the
+  network task, checks app task creation, and added fatal FreeRTOS malloc/stack diagnostics.
+  Fixed history requests accidentally being serviced only before DHCP. Clean-built, flashed,
+  and verified UI/touch startup, link/DHCP, Web UI HTTP 200, Web UI symbol add, and live
+  AMD/NVDA/AAPL quote cycles on target.
 
 - **2026-06-09 — Claude (Opus 4.8, Claude Code):** Added company logos from the API (NOT yet
   on-target tested). API (github.com/Rozakos/stock-api) serves logos only at GET /logo/{symbol}
