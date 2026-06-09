@@ -1610,7 +1610,9 @@ void StartDefaultTask(void const * argument)
   osThreadDef(uiTask, StartUiTask, osPriorityNormal, 0, 2048);
   osThreadCreate(osThread(uiTask), NULL);
 
-  osThreadDef(webTask, StartWebTask, osPriorityBelowNormal, 0, 1024);
+  /* 2048 words: handle_client (request[1536]) nests append_symbols_page
+   * (form[2300] + row buffers) ~4.1 KB of stack buffers; 1024 overflowed. */
+  osThreadDef(webTask, StartWebTask, osPriorityBelowNormal, 0, 2048);
   osThreadCreate(osThread(webTask), NULL);
 
   /* Infinite loop */

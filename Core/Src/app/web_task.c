@@ -4,6 +4,7 @@
 #include "app/stock_data.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "lwip/inet.h"
@@ -36,14 +37,15 @@ static size_t append_symbols_page(char *buffer)
 
   used = append(buffer, used,
     "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>NUCLEO Stock Ticker</title><style>"
-    ":root{--bg:#0b0f17;--card:#16202d;--border:#303b4a;--text:#e7eef7;--muted:#8a98ad;--red:#c42525;--green:#4ade80}"
-    "*{box-sizing:border-box}body{font-family:system-ui,sans-serif;max-width:620px;margin:auto;padding:20px;background:var(--bg);color:var(--text)}"
-    "header{border-bottom:2px solid var(--red);margin-bottom:20px}h1{font-size:22px}h2{font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px}"
-    ".card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px;margin:8px 0;display:flex;justify-content:space-between}"
-    ".muted{color:var(--muted)}input,button{padding:11px;border-radius:7px;border:1px solid var(--border);background:#0d131d;color:var(--text);font-size:16px}"
-    "input{width:100%}button{background:var(--red);font-weight:bold;margin-top:10px;width:100%}.up{color:var(--green)}"
-    "</style></head><body><header><h1>ROZAKOS INDUSTRIES</h1><p class=muted>STM32 Stock Ticker Web Admin</p></header>"
+    "<title>Rozakos Industries - Stock Ticker</title><style>"
+    ":root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--red:#c42525;--green:#4ade80}"
+    "*{box-sizing:border-box}body{font-family:system-ui,sans-serif;max-width:540px;margin:auto;padding:0 16px 24px;background:var(--bg);color:var(--text)}"
+    "header{background:#110808;border-bottom:1px solid #3d1c1c;margin:0 -16px 18px;padding:16px}h1{font-size:20px;margin:0}h2{font-size:11px;margin:22px 0 8px;color:var(--muted);text-transform:uppercase;letter-spacing:1.5px}"
+    ".card,table{width:100%;background:var(--card);border:1px solid var(--border);border-radius:8px}.card{padding:12px;margin:7px 0;display:flex;justify-content:space-between}"
+    "table{border-collapse:separate;border-spacing:0;overflow:hidden}td{padding:9px 12px;border-top:1px solid var(--border)}tr:first-child td{border-top:0}"
+    ".muted{color:var(--muted)}input,button{padding:9px;border-radius:6px;border:1px solid var(--border);background:#0d1117;color:var(--text);font-size:15px}"
+    "button{background:var(--red);font-weight:bold}.add{display:flex;gap:8px}.add input{flex:1;min-width:0}.del{padding:5px 10px}.right{text-align:right}.up{color:var(--green)}.down{color:#f87171}"
+    "</style></head><body><header><h1>ROZAKOS INDUSTRIES</h1><div class=muted>STM32 Stock Ticker Web Admin</div></header>"
     "<h2>Live Markets</h2>");
 
   for (size_t i = 0; i < symbol_count; ++i)
@@ -60,8 +62,9 @@ static size_t append_symbols_page(char *buffer)
       format_decimal_2(price, sizeof(price), found->last, 0);
       format_decimal_2(change, sizeof(change), found->change_pct, 1);
       snprintf(row, sizeof(row),
-               "<div class=card><strong>%s</strong><span>$%s &nbsp; <span class=up>%s%%</span></span></div>",
-               symbols[i], price, change);
+               "<div class=card><strong>%s</strong><span>$%s &nbsp; <span class=%s>%s%%</span></span></div>",
+               symbols[i], price, found->change_pct >= 0.0f ? "up" : "down",
+               change);
     }
     else
     {
@@ -72,19 +75,35 @@ static size_t append_symbols_page(char *buffer)
     used = append(buffer, used, row);
   }
 
-  char csv[APP_MAX_SYMBOLS * APP_SYMBOL_LENGTH] = { 0 };
+  used = append(buffer, used, "<h2>Symbols</h2><table>");
   for (size_t i = 0; i < symbol_count; ++i)
   {
-    if (i > 0U) strncat(csv, ",", sizeof(csv) - strlen(csv) - 1U);
-    strncat(csv, symbols[i], sizeof(csv) - strlen(csv) - 1U);
+    char row[220];
+    snprintf(row, sizeof(row),
+             "<tr><td><strong>%s</strong></td><td class=right>"
+             "<form method=POST action=/delete><input type=hidden name=i value=%u>"
+             "<button class=del type=submit>&times;</button></form></td></tr>",
+             symbols[i], (unsigned)i);
+    used = append(buffer, used, row);
   }
-  char form[700];
+  used = append(buffer, used, "</table>");
+
+  char form[2300];
   snprintf(form, sizeof(form),
-    "<h2>Symbols</h2><form method=POST action=/symbols>"
-    "<input name=symbols value='%s' maxlength=95>"
-    "<p class=muted>Comma-separated, up to %u symbols. Changes apply immediately.</p>"
-    "<button type=submit>Save symbols</button></form></body></html>",
-    csv, APP_MAX_SYMBOLS);
+    "<datalist id=symbols><option value=AAPL><option value=MSFT><option value=GOOGL>"
+    "<option value=AMZN><option value=META><option value=TSLA><option value=NVDA>"
+    "<option value=AMD><option value=INTC><option value=TSM><option value=HPE>"
+    "<option value=NOK><option value=SPY><option value=QQQ></datalist>"
+    "<h2>Add Symbol</h2><form class=add method=POST action=/add>"
+    "<input name=symbol placeholder=AMD maxlength=11 required list=symbols>"
+    "<button type=submit>Add</button></form>"
+    "<h2>Settings</h2><form class=add method=POST action=/settings>"
+    "<input name=refresh_s type=number min=15 max=3600 value=%lu required>"
+    "<button type=submit>Save refresh</button></form>"
+    "<p class=muted>Seconds between quote refreshes. Up to %u symbols. "
+    "Settings apply immediately but reset to firmware defaults after reboot.</p>"
+    "</body></html>",
+    (unsigned long)settings_get_refresh_seconds(), APP_MAX_SYMBOLS);
   used = append(buffer, used, form);
   buffer[used] = '\0';
   return used;
@@ -127,23 +146,81 @@ static void send_all(int client, const char *data, size_t length)
   }
 }
 
+static int receive_request(int client, char *request, size_t capacity)
+{
+  size_t used = 0;
+  size_t expected = 0;
+  while (used < capacity - 1U)
+  {
+    int received = recv(client, request + used, capacity - 1U - used, 0);
+    if (received <= 0) break;
+    used += (size_t)received;
+    request[used] = '\0';
+
+    char *body = strstr(request, "\r\n\r\n");
+    if (body != NULL)
+    {
+      if (expected == 0U)
+      {
+        char *length = strstr(request, "Content-Length:");
+        expected = (size_t)(body + 4 - request);
+        if (length != NULL)
+        {
+          expected += (size_t)strtoul(length + 15, NULL, 10);
+        }
+      }
+      if (used >= expected) break;
+    }
+  }
+  request[used] = '\0';
+  return (int)used;
+}
+
+static char *form_value(char *request, const char *name)
+{
+  char *body = strstr(request, "\r\n\r\n");
+  if (body == NULL) return NULL;
+  body += 4;
+
+  size_t name_length = strlen(name);
+  for (char *field = body; field != NULL && *field != '\0';)
+  {
+    if (strncmp(field, name, name_length) == 0 && field[name_length] == '=')
+    {
+      char *value = field + name_length + 1U;
+      char *end = strchr(value, '&');
+      if (end != NULL) *end = '\0';
+      url_decode(value);
+      return value;
+    }
+    field = strchr(field, '&');
+    if (field != NULL) ++field;
+  }
+  return NULL;
+}
+
 static void handle_client(int client)
 {
-  char request[1024];
-  int received = recv(client, request, sizeof(request) - 1U, 0);
+  char request[1536];
+  int received = receive_request(client, request, sizeof(request));
   if (received <= 0) return;
-  request[received] = '\0';
 
-  if (strncmp(request, "POST /symbols ", 14) == 0)
+  if (strncmp(request, "POST /add ", 10) == 0)
   {
-    char *body = strstr(request, "\r\n\r\n");
-    if (body != NULL && strncmp(body + 4, "symbols=", 8) == 0)
+    char *symbol = form_value(request, "symbol");
+    if (symbol != NULL) settings_add_symbol(symbol);
+  }
+  else if (strncmp(request, "POST /delete ", 13) == 0)
+  {
+    char *index = form_value(request, "i");
+    if (index != NULL) settings_delete_symbol((size_t)strtoul(index, NULL, 10));
+  }
+  else if (strncmp(request, "POST /settings ", 15) == 0)
+  {
+    char *refresh = form_value(request, "refresh_s");
+    if (refresh != NULL)
     {
-      body += 12;
-      char *end = strpbrk(body, "\r\n&");
-      if (end != NULL) *end = '\0';
-      url_decode(body);
-      settings_set_symbols_csv(body);
+      settings_set_refresh_seconds((uint32_t)strtoul(refresh, NULL, 10));
     }
   }
 

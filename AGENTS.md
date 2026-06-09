@@ -145,6 +145,12 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-09 — Claude (Opus 4.8, Claude Code):** Reviewed Codex's uncommitted web-admin work
+  (runtime symbol add/delete + refresh-interval via POST forms; `receive_request`/`form_value`
+  HTTP parsing; multi-symbol rotation in `net_task`). Found + fixed a **webTask stack overflow**:
+  the enlarged `request[1536]` + `form[2300]` buffers (~4.1 KB) exceeded the 1024-word (4 KB)
+  stack → bumped `webTask` to 2048 words in `main.c`. Verified no divide-by-zero (symbol_count
+  ≥1 invariant holds), `<ctype.h>` present, critical-section use consistent. Committed + pushed.
 - **2026-06-09 — Codex (GPT-5):** Wired detail range controls to real history API requests.
   Added a thread-safe generation-based history request/result mailbox so LVGL never blocks on
   HTTPS and stale responses cannot overwrite newer taps. The network task wakes immediately,

@@ -22,6 +22,7 @@ typedef struct
 } stock_snapshot_t;
 
 void stock_data_publish(const stock_snapshot_t *snapshot);
+void stock_data_reset(void);
 bool stock_data_get(stock_snapshot_t *snapshot);
 size_t stock_data_get_all(stock_snapshot_t snapshots[APP_MAX_SYMBOLS]);
 

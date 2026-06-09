@@ -411,7 +411,9 @@ static void create_market_screen(void)
   lv_obj_set_style_bg_color(list, lv_color_hex(0x0B0F17), 0);
   lv_obj_set_style_border_width(list, 0, 0);
   lv_obj_set_style_radius(list, 0, 0);
-  lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_style_bg_color(list, lv_color_hex(0xED1C24), LV_PART_SCROLLBAR);
+  lv_obj_set_style_width(list, 4, LV_PART_SCROLLBAR);
 
   rebuild_rows();
 }

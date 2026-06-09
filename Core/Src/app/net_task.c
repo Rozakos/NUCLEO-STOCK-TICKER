@@ -87,6 +87,7 @@ void StartNetTask(void const *argument)
       symbol_count = settings_get_symbols(symbols);
       symbol_index = 0;
       settings_seen = settings_generation();
+      stock_data_reset();
       printf("[stock] symbols updated from web UI\r\n");
     }
 
@@ -114,6 +115,7 @@ void StartNetTask(void const *argument)
     stock_data_publish(&snapshot);
 
     symbol_index = (symbol_index + 1U) % symbol_count;
-    wait_for_refresh_or_settings(STOCK_REFRESH_MS / symbol_count, settings_seen);
+    wait_for_refresh_or_settings(
+        (settings_get_refresh_seconds() * 1000U) / symbol_count, settings_seen);
   }
 }

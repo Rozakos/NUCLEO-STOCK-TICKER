@@ -8,6 +8,14 @@
 static stock_snapshot_t snapshots[APP_MAX_SYMBOLS];
 static size_t snapshot_count;
 
+void stock_data_reset(void)
+{
+  taskENTER_CRITICAL();
+  memset(snapshots, 0, sizeof(snapshots));
+  snapshot_count = 0;
+  taskEXIT_CRITICAL();
+}
+
 void stock_data_publish(const stock_snapshot_t *snapshot)
 {
   taskENTER_CRITICAL();
