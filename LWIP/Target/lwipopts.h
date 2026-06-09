@@ -122,6 +122,11 @@
 #define DNS_TABLE_SIZE          4
 #define DNS_MAX_NAME_LENGTH     256
 
+/* CubeMX sized MEMP_NUM_SYS_TIMEOUT (=5) before DNS was on; DNS needs one more
+ * timeout slot. Override (init.c enforces a minimum). */
+#undef  MEMP_NUM_SYS_TIMEOUT
+#define MEMP_NUM_SYS_TIMEOUT    8
+
 /* Give the netconn/socket API a bit more headroom for the HTTPS client later. */
 #define MEM_SIZE                (16 * 1024)
 /* USER CODE END 1 */

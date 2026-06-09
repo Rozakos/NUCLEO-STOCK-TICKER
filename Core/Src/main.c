@@ -181,7 +181,13 @@ int main(void)
   MX_USART6_UART_Init();
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
-
+  /* M1 diagnostic: raw UART write BEFORE the RTOS/LwIP start and without using
+   * newlib printf. If this line shows on the serial console, then USART1 + the
+   * COM port + baud are correct, and any later silence is a downstream issue. */
+  {
+    static const char boot_msg[] = "\r\n[main] boot OK - USART1 console alive @115200 8N1\r\n";
+    HAL_UART_Transmit(&huart1, (uint8_t *)boot_msg, sizeof(boot_msg) - 1, HAL_MAX_DELAY);
+  }
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */

@@ -69,12 +69,9 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
 - [x] CubeMX skeleton (ETH MAC, LTDC 480×272 RGB565 FB @0xC0000000, FMC/SDRAM, DMA2D, SDMMC,
       FreeRTOS, FATFS, I2C1/I2C3, USART1).
 - [x] Git repo + `.gitignore`/`.gitattributes`, app config/secrets scaffolding, printf console, README.
-- [~] **M1 Ethernet** (code complete, awaiting on-target verify): LwIP enabled in CubeMX
-      (DHCP, RTOS). DNS turned on via `lwipopts.h` USER CODE. `Core/Src/app/net_task.c`
-      waits for DHCP, logs IP/GW/mask, resolves `rozakos.eu`, opens a TCP connect — all over
-      USART1. Task created in `main.c` StartDefaultTask USER CODE 5 after `MX_LWIP_Init()`.
-      Linker: added `.lwip_sec` (NOLOAD, RAM) for ETH descriptors + bumped heap to 0x1000.
-      **NEXT: build + flash, watch UART @115200 for "TCP connect OK".**
+- [~] **M1 Ethernet** (on-target debugging in progress): LwIP enabled in CubeMX (DHCP, RTOS).
+      UART console CONFIRMED WORKING — board boots, LwIP inits, net task runs. DHCP was NOT
+      binding; root cause found + fixed (see below). **Awaiting re-test after the link-thread fix.**
 - [ ] **M2 HTTPS+JSON**: enable mbedTLS in CubeMX; `https_client.c` (mbedTLS/LwIP sockets) +
       `stock_api.c` + cJSON → print parsed price/change for a symbol.
 - [ ] **M3 Display**: vendor LVGL 9.x + Disco BSP; `display.c` (LTDC+DMA2D flush, double buffer in
@@ -83,20 +80,49 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
       (FATFS). Compile-time symbols from `config.h`; web admin later.
 - [ ] Later: web admin (LwIP httpd + settings on SD), WiFi as alternate netif.
 
-## 6. NEXT ACTION (start here)
+## 6. NEXT ACTION (start here)  — for the next agent (Codex)
 
-**M1 verify:** In STM32CubeIDE, **Project → Build** (expect clean link — confirm the linker
-placed `.RxDecripSection`/`.TxDecripSection` in RAM, not FLASH). Flash to the board, open a
-serial terminal on the ST-Link VCP **@115200 8N1**, plug in Ethernet, and expect:
+**State as of last session (verified on hardware):** UART console works. After flash + reset
+the board prints:
 ```
+[main] boot OK - USART1 console alive @115200 8N1
 [boot] NUCLEO-STOCK-TICKER: LwIP up, starting net task
-[net] waiting for link + DHCP...
-[net] DHCP bound. IP  = <addr>
-[net] DNS rozakos.eu -> <addr>
-[net] TCP connect OK (stack reaches the API host)
+[net] waiting for link + DHCP...      <-- got stuck here (no DHCP)
 ```
-If DHCP never binds: check cable/PHY; if DNS fails: confirm `LWIP_DNS 1` took effect; if TCP
-fails but DNS works: firewall/routing. Then proceed to **M2** (mbedTLS).
+Ethernet RJ45 green LED blinks (PHY link present). DHCP never bound.
+
+**Root cause (FIXED, needs re-test):** CubeMX generated `LWIP/Target/ethernetif.c` with an
+**empty `ethernet_link_thread()`** — it never detected PHY link, never called
+`HAL_ETH_Start_IT()`, so the ETH RX path never started and DHCP OFFERs were never received.
+Last session filled in the link thread (USER CODE block): reads LAN8742 BMSR (reg 1) link bit,
+on link-up reads PSCSR (reg 31) for speed/duplex, calls `HAL_ETH_SetMACConfig` +
+`HAL_ETH_Start_IT` + `netif_set_link_up` (and prints `[eth] link UP (100M/full)`); on link-down
+stops + `netif_set_link_down`. PHY_ADDRESS=0. The RX `HAL_ETH_Rx*Callback`s are weak HAL
+overrides (no registration needed) — already present and correct.
+
+**DO THIS NEXT:**
+1. Rebuild + flash + reset. Watch UART. EXPECT now:
+   ```
+   [eth] link UP (100M/full)
+   [net] DHCP bound. IP  = 192.168.x.x
+   [net] DNS rozakos.eu -> <ip>
+   [net] TCP connect OK (stack reaches the API host)
+   ```
+2. If `[eth] link UP` prints but DHCP still fails → RX path issue. Check `HAL_ETH_ReadData`
+   actually returns frames; verify RX_POOL (`ETH_RX_BUFFER_CNT`) and that pbufs are freed.
+   With D-cache OFF the `SCB_InvalidateDCache_by_Addr` in `HAL_ETH_RxLinkCallback` is a no-op
+   (fine). Try a static IP (`config.h` NET_USE_DHCP=0 path is NOT wired in net_task yet — would
+   need adding) to isolate DHCP vs RX.
+3. If `[eth] link UP` never prints → PHY read issue: confirm PHY addr (0), that `HAL_ETH_Init`
+   succeeded (else `Error_Handler`), MDIO clock. Consider using ST's `lan8742.c` driver from the
+   FW package instead of raw PHY reg reads.
+4. Once `TCP connect OK` shows → **M1 DONE**, commit, move to **M2 (mbedTLS HTTPS + cJSON)**:
+   enable mbedTLS in CubeMX (raise FreeRTOS heap + netTask stack a lot — TLS is heavy), write
+   `app/https_client.c` (mbedTLS over LwIP sockets, `TLS_INSECURE_SKIP_VERIFY` first) +
+   `app/stock_api.c` + vendored cJSON; GET `/stocks/api/v1/stock/AAPL` with
+   `Authorization: Bearer <STOCK_API_TOKEN>` and print parsed price/change.
+
+### (done) Enabling LwIP in CubeMX — kept for reference
 
 ### (done) Enabling LwIP in CubeMX — kept for reference
 Open `NUCLEO-STOCK-TICKER.ioc`:
@@ -131,6 +157,12 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 - **2026-06-09 — Claude (Opus 4.8, Claude Code):** git init + ignore/attributes; `Core/Inc/app/`
   `config.h` + `secrets.h(.example)`; printf→USART1 retarget in `main.c`; `README.md`; this
   `AGENTS.md`. Decided CubeMX route for LwIP/mbedTLS. Pushed to GitHub.
+- **2026-06-09 — Claude (Opus 4.8, Claude Code):** on-target M1 debugging. Fixed build error
+  (`MEMP_NUM_SYS_TIMEOUT` 5→8 in `lwipopts.h` USER CODE, needed once DNS on). Added a raw-UART
+  boot diagnostic in `main.c` USER CODE 2 (confirmed console works). Diagnosed DHCP-not-binding:
+  CubeMX left `ethernet_link_thread()` EMPTY in `LWIP/Target/ethernetif.c`; implemented PHY
+  link detection + `HAL_ETH_Start_IT` + `netif_set_link_up` (LAN8742, addr 0) in its USER CODE
+  block, plus PHY defines + `<stdio.h>` in USER CODE 0. **Handed off to Codex for re-test — see §6.**
 - **2026-06-09 — Claude (Opus 4.8, Claude Code):** user enabled LwIP in CubeMX + regenerated
   (ETH ownership moved to `ethernetif.c`, `MX_LWIP_Init` in StartDefaultTask). Verified caches
   are OFF (no ETH-DMA coherency issue yet). M1 code: enabled `LWIP_DNS` + `MEM_SIZE 16K` in

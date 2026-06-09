@@ -35,7 +35,12 @@
 
 /* Within 'USER CODE' section, code will be kept by default at each generation */
 /* USER CODE BEGIN 0 */
-
+#include <stdio.h>
+/* LAN8742 PHY (RMII) on the STM32F746G-DISCO is at address 0 (see .ioc). */
+#define PHY_ADDRESS              0U
+#define PHY_BSR_REG              0x01U   /* Basic Status Register */
+#define PHY_BSR_LINK_STATUS      0x0004U /* bit 2: link up (latched low) */
+#define PHY_LAN8742_PSCSR_REG    0x1FU   /* PHY Special Control/Status Register */
 /* USER CODE END 0 */
 
 /* Private define ------------------------------------------------------------*/
@@ -569,7 +574,52 @@ void ethernet_link_thread(void const * argument)
   {
 
 /* USER CODE BEGIN ETH link Thread core code for User BSP */
+    {
+      struct netif *netif = (struct netif *)argument;
+      static uint8_t link_prev = 0xFFU;   /* force an update on first pass */
+      uint32_t bsr = 0U;
+      uint8_t link_now;
 
+      /* BMSR link-status bit is latched-low: read twice for current state. */
+      HAL_ETH_ReadPHYRegister(&heth, PHY_ADDRESS, PHY_BSR_REG, &bsr);
+      HAL_ETH_ReadPHYRegister(&heth, PHY_ADDRESS, PHY_BSR_REG, &bsr);
+      link_now = (bsr & PHY_BSR_LINK_STATUS) ? 1U : 0U;
+
+      if (link_now != link_prev)
+      {
+        if (link_now)
+        {
+          /* LAN8742 PSCSR (reg 31) bits[4:2] = HCDSPEED: 110=100FD, 101=10FD,
+           * 010=100HD, 001=10HD. Configure MAC to match, then start ETH. */
+          ETH_MACConfigTypeDef macconf;
+          uint32_t pscsr = 0U;
+          HAL_ETH_ReadPHYRegister(&heth, PHY_ADDRESS, PHY_LAN8742_PSCSR_REG, &pscsr);
+          uint32_t spd = (pscsr >> 2) & 0x07U;
+
+          HAL_ETH_GetMACConfig(&heth, &macconf);
+          switch (spd)
+          {
+            case 0x06U: macconf.Speed = ETH_SPEED_100M; macconf.DuplexMode = ETH_FULLDUPLEX_MODE; break;
+            case 0x05U: macconf.Speed = ETH_SPEED_10M;  macconf.DuplexMode = ETH_FULLDUPLEX_MODE; break;
+            case 0x02U: macconf.Speed = ETH_SPEED_100M; macconf.DuplexMode = ETH_HALFDUPLEX_MODE; break;
+            default:    macconf.Speed = ETH_SPEED_10M;  macconf.DuplexMode = ETH_HALFDUPLEX_MODE; break;
+          }
+          HAL_ETH_SetMACConfig(&heth, &macconf);
+          HAL_ETH_Start_IT(&heth);
+          netif_set_link_up(netif);
+          printf("[eth] link UP (%s/%s)\r\n",
+                 (macconf.Speed == ETH_SPEED_100M) ? "100M" : "10M",
+                 (macconf.DuplexMode == ETH_FULLDUPLEX_MODE) ? "full" : "half");
+        }
+        else
+        {
+          HAL_ETH_Stop_IT(&heth);
+          netif_set_link_down(netif);
+          printf("[eth] link DOWN\r\n");
+        }
+        link_prev = link_now;
+      }
+    }
 /* USER CODE END ETH link Thread core code for User BSP */
 
     osDelay(100);
