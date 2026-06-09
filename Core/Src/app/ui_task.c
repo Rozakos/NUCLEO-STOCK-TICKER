@@ -298,6 +298,7 @@ static void update_rows(void)
         lv_obj_set_size(rows[row].badge, 38, 38);
         lv_obj_clear_flag(rows[row].badge, LV_OBJ_FLAG_CLICKABLE);
         rows[row].logo_applied = true;
+        printf("[ui] logo applied: %s\r\n", rows[row].symbol);
       }
     }
 

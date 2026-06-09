@@ -158,7 +158,7 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
   memory, where LVGL TLSF's normal/unaligned accesses stalled. Added an 8 MiB normal
   non-cacheable MPU region before HAL initialization, then re-enabled the 2 MiB SDRAM LVGL
   heap, 512 KiB image cache, and lodepng. Clean-built, flashed, and verified full UI startup,
-  pinned-TLS quote fetches, and multiple cached logos without a stall.
+  pinned-TLS quote fetches, and `[ui] logo applied: AAPL` after decoding a fetched PNG.
 
 - **2026-06-09 - Codex (GPT-5):** Enabled required TLS certificate verification. Inspected the
   live `rozakos.eu` chain, pinned the Google Trust Services WE1 intermediate (valid through
