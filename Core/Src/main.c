@@ -18,14 +18,15 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "string.h"
 #include "cmsis_os.h"
 #include "fatfs.h"
+#include "lwip.h"
 #include "usb_host.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include "app/net_task.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,25 +45,6 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-#if defined ( __ICCARM__ ) /*!< IAR Compiler */
-#pragma location=0x2004c000
-ETH_DMADescTypeDef  DMARxDscrTab[ETH_RX_DESC_CNT]; /* Ethernet Rx DMA Descriptors */
-#pragma location=0x2004c0a0
-ETH_DMADescTypeDef  DMATxDscrTab[ETH_TX_DESC_CNT]; /* Ethernet Tx DMA Descriptors */
-
-#elif defined ( __CC_ARM )  /* MDK ARM Compiler */
-
-__attribute__((at(0x2004c000))) ETH_DMADescTypeDef  DMARxDscrTab[ETH_RX_DESC_CNT]; /* Ethernet Rx DMA Descriptors */
-__attribute__((at(0x2004c0a0))) ETH_DMADescTypeDef  DMATxDscrTab[ETH_TX_DESC_CNT]; /* Ethernet Tx DMA Descriptors */
-
-#elif defined ( __GNUC__ ) /* GNU Compiler */
-
-ETH_DMADescTypeDef DMARxDscrTab[ETH_RX_DESC_CNT] __attribute__((section(".RxDecripSection"))); /* Ethernet Rx DMA Descriptors */
-ETH_DMADescTypeDef DMATxDscrTab[ETH_TX_DESC_CNT] __attribute__((section(".TxDecripSection")));   /* Ethernet Tx DMA Descriptors */
-#endif
-
-ETH_TxPacketConfig TxConfig;
-
 ADC_HandleTypeDef hadc3;
 
 CRC_HandleTypeDef hcrc;
@@ -70,8 +52,6 @@ CRC_HandleTypeDef hcrc;
 DCMI_HandleTypeDef hdcmi;
 
 DMA2D_HandleTypeDef hdma2d;
-
-ETH_HandleTypeDef heth;
 
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c3;
@@ -116,7 +96,6 @@ static void MX_ADC3_Init(void);
 static void MX_CRC_Init(void);
 static void MX_DCMI_Init(void);
 static void MX_DMA2D_Init(void);
-static void MX_ETH_Init(void);
 static void MX_FMC_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C3_Init(void);
@@ -182,7 +161,6 @@ int main(void)
   MX_CRC_Init();
   MX_DCMI_Init();
   MX_DMA2D_Init();
-  MX_ETH_Init();
   MX_FMC_Init();
   MX_I2C1_Init();
   MX_I2C3_Init();
@@ -485,55 +463,6 @@ static void MX_DMA2D_Init(void)
   /* USER CODE BEGIN DMA2D_Init 2 */
 
   /* USER CODE END DMA2D_Init 2 */
-
-}
-
-/**
-  * @brief ETH Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_ETH_Init(void)
-{
-
-  /* USER CODE BEGIN ETH_Init 0 */
-
-  /* USER CODE END ETH_Init 0 */
-
-   static uint8_t MACAddr[6];
-
-  /* USER CODE BEGIN ETH_Init 1 */
-
-  /* USER CODE END ETH_Init 1 */
-  heth.Instance = ETH;
-  MACAddr[0] = 0x00;
-  MACAddr[1] = 0x80;
-  MACAddr[2] = 0xE1;
-  MACAddr[3] = 0x00;
-  MACAddr[4] = 0x00;
-  MACAddr[5] = 0x00;
-  heth.Init.MACAddr = &MACAddr[0];
-  heth.Init.MediaInterface = HAL_ETH_RMII_MODE;
-  heth.Init.TxDesc = DMATxDscrTab;
-  heth.Init.RxDesc = DMARxDscrTab;
-  heth.Init.RxBuffLen = 1524;
-
-  /* USER CODE BEGIN MACADDRESS */
-
-  /* USER CODE END MACADDRESS */
-
-  if (HAL_ETH_Init(&heth) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  memset(&TxConfig, 0 , sizeof(ETH_TxPacketConfig));
-  TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CSUM | ETH_TX_PACKETS_FEATURES_CRCPAD;
-  TxConfig.ChecksumCtrl = ETH_CHECKSUM_IPHDR_PAYLOAD_INSERT_PHDR_CALC;
-  TxConfig.CRCPadCtrl = ETH_CRC_PAD_INSERT;
-  /* USER CODE BEGIN ETH_Init 2 */
-
-  /* USER CODE END ETH_Init 2 */
 
 }
 
@@ -1656,7 +1585,18 @@ void StartDefaultTask(void const * argument)
 {
   /* init code for USB_HOST */
   MX_USB_HOST_Init();
+
+  /* init code for LWIP */
+  MX_LWIP_Init();
   /* USER CODE BEGIN 5 */
+  printf("\r\n[boot] NUCLEO-STOCK-TICKER: LwIP up, starting net task\r\n");
+
+  /* Start the M1 networking task now that LwIP is initialized.
+   * Stack is in CMSIS-RTOS v1 words; 1024 (=4 KB) is ample for DHCP/DNS/TCP.
+   * (mbedTLS in M2 will need a much larger stack.) */
+  osThreadDef(netTask, StartNetTask, osPriorityNormal, 0, 1024);
+  osThreadCreate(osThread(netTask), NULL);
+
   /* Infinite loop */
   for(;;)
   {

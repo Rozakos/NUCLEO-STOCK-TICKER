@@ -69,8 +69,12 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
 - [x] CubeMX skeleton (ETH MAC, LTDC 480×272 RGB565 FB @0xC0000000, FMC/SDRAM, DMA2D, SDMMC,
       FreeRTOS, FATFS, I2C1/I2C3, USART1).
 - [x] Git repo + `.gitignore`/`.gitattributes`, app config/secrets scaffolding, printf console, README.
-- [ ] **M1 Ethernet**: enable LwIP in CubeMX (DHCP+DNS, RTOS) → `net_task.c` waits for DHCP,
-      resolves `rozakos.eu`, opens TCP; logs IP/DNS/connect over UART.
+- [~] **M1 Ethernet** (code complete, awaiting on-target verify): LwIP enabled in CubeMX
+      (DHCP, RTOS). DNS turned on via `lwipopts.h` USER CODE. `Core/Src/app/net_task.c`
+      waits for DHCP, logs IP/GW/mask, resolves `rozakos.eu`, opens a TCP connect — all over
+      USART1. Task created in `main.c` StartDefaultTask USER CODE 5 after `MX_LWIP_Init()`.
+      Linker: added `.lwip_sec` (NOLOAD, RAM) for ETH descriptors + bumped heap to 0x1000.
+      **NEXT: build + flash, watch UART @115200 for "TCP connect OK".**
 - [ ] **M2 HTTPS+JSON**: enable mbedTLS in CubeMX; `https_client.c` (mbedTLS/LwIP sockets) +
       `stock_api.c` + cJSON → print parsed price/change for a symbol.
 - [ ] **M3 Display**: vendor LVGL 9.x + Disco BSP; `display.c` (LTDC+DMA2D flush, double buffer in
@@ -81,7 +85,21 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
 
 ## 6. NEXT ACTION (start here)
 
-Enable LwIP in CubeMX, then regenerate. Open `NUCLEO-STOCK-TICKER.ioc`:
+**M1 verify:** In STM32CubeIDE, **Project → Build** (expect clean link — confirm the linker
+placed `.RxDecripSection`/`.TxDecripSection` in RAM, not FLASH). Flash to the board, open a
+serial terminal on the ST-Link VCP **@115200 8N1**, plug in Ethernet, and expect:
+```
+[boot] NUCLEO-STOCK-TICKER: LwIP up, starting net task
+[net] waiting for link + DHCP...
+[net] DHCP bound. IP  = <addr>
+[net] DNS rozakos.eu -> <addr>
+[net] TCP connect OK (stack reaches the API host)
+```
+If DHCP never binds: check cable/PHY; if DNS fails: confirm `LWIP_DNS 1` took effect; if TCP
+fails but DNS works: firewall/routing. Then proceed to **M2** (mbedTLS).
+
+### (done) Enabling LwIP in CubeMX — kept for reference
+Open `NUCLEO-STOCK-TICKER.ioc`:
 1. **Middleware and Software Packs → LWIP → Enabled**.
 2. General: `LWIP_DHCP = Enabled`; ensure `WITH_RTOS`/`NO_SYS=0` (FreeRTOS present);
    enable `LWIP_DNS`, `LWIP_NETCONN`, `LWIP_SOCKET`. Bump `MEM_SIZE` and `PBUF`/`MEMP`
@@ -112,4 +130,10 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 - **2026-06-09 — Claude (Opus 4.8, Claude Code):** git init + ignore/attributes; `Core/Inc/app/`
   `config.h` + `secrets.h(.example)`; printf→USART1 retarget in `main.c`; `README.md`; this
-  `AGENTS.md`. Decided CubeMX route for LwIP/mbedTLS. Next action = enable LwIP in CubeMX (§6).
+  `AGENTS.md`. Decided CubeMX route for LwIP/mbedTLS. Pushed to GitHub.
+- **2026-06-09 — Claude (Opus 4.8, Claude Code):** user enabled LwIP in CubeMX + regenerated
+  (ETH ownership moved to `ethernetif.c`, `MX_LWIP_Init` in StartDefaultTask). Verified caches
+  are OFF (no ETH-DMA coherency issue yet). M1 code: enabled `LWIP_DNS` + `MEM_SIZE 16K` in
+  `lwipopts.h` USER CODE; added `.lwip_sec` RAM section + heap bump in `STM32F746NGHX_FLASH.ld`;
+  wrote `app/net_task.{c,h}` (DHCP wait → DNS → TCP connect, logged on USART1); created the task
+  in `main.c`. Token set locally in `secrets.h` (git-ignored). **Next = on-target M1 verify (§6).**
