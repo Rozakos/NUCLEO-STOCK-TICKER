@@ -85,8 +85,9 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
       others show a brand-colored initial badge) with a full-width chart and range buttons that
       asynchronously fetch real `/history/{symbol}?range=...` data via the serialized TLS task.
 - [~] **Web admin**: runtime symbol add/delete and refresh interval work at
-      `http://<board-ip>/`. Settings are not persisted across reset yet.
-- [ ] Later: persistent settings on SD, pinned CA verification, WiFi as alternate netif.
+      `http://<board-ip>/`. Settings load/save atomically through `ticker.cfg` on SD when a
+      formatted card is available; target currently reports SD unavailable.
+- [ ] Later: pinned CA verification, WiFi as alternate netif.
 
 ## 6. NEXT ACTION (start here)
 
@@ -150,6 +151,11 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-09 - Codex (GPT-5):** Added persistent Web UI settings using the existing
+  reentrant FatFs/SD stack. The Web task mounts SD, loads `ticker.cfg`, and successful symbol
+  or refresh changes atomically replace the config through `ticker.tmp`. Missing/unformatted
+  SD cards safely use compile-time defaults. Built, flashed, and verified the fallback path on
+  target; hardware reported SD unavailable, so persistence with a card remains to be confirmed.
 - **2026-06-09 - Codex (GPT-5):** Restored stable startup after the logo commit caused
   `lv_display_create()` to hang on the first allocation from an external-SDRAM LVGL heap.
   Returned LVGL to its proven internal 64 KiB heap and disabled lodepng until the SDRAM

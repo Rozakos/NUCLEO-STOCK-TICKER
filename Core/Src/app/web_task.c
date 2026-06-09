@@ -237,6 +237,7 @@ static void handle_client(int client)
 void StartWebTask(void const *argument)
 {
   (void)argument;
+  settings_storage_load();
   while (ip4_addr_isany_val(*netif_ip4_addr(&gnetif))) osDelay(250);
 
   int server = socket(AF_INET, SOCK_STREAM, 0);

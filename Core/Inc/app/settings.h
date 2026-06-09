@@ -9,6 +9,7 @@
 #define APP_SYMBOL_LENGTH 12U
 
 void settings_init(void);
+void settings_storage_load(void);
 size_t settings_get_symbols(char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH]);
 bool settings_set_symbols_csv(const char *csv);
 bool settings_add_symbol(const char *symbol);
