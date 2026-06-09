@@ -1,6 +1,7 @@
 #include "app/net_task.h"
 #include "app/config.h"
 #include "app/format.h"
+#include "app/history_data.h"
 #include "app/settings.h"
 #include "app/stock_api.h"
 #include "app/stock_data.h"
@@ -18,7 +19,8 @@ static void wait_for_refresh_or_settings(uint32_t delay_ms,
 {
   uint32_t start = osKernelSysTick();
   while ((osKernelSysTick() - start) < delay_ms &&
-         settings_generation() == settings_seen)
+         settings_generation() == settings_seen &&
+         !history_data_request_pending())
   {
     osDelay(250);
   }
@@ -29,6 +31,32 @@ static void net_wait_for_ip(void)
   printf("[net] waiting for link + DHCP...\r\n");
   for (;;)
   {
+    history_request_t history_request;
+    if (history_data_take_request(&history_request))
+    {
+      history_snapshot_t history = { 0 };
+      char error[96];
+      printf("[history] fetching %s %s...\r\n", history_request.symbol,
+             history_request.range);
+      if (stock_api_fetch_history(&history_request, &history, error,
+                                  sizeof(error)) == 0)
+      {
+        if (history_data_request_current(history_request.generation))
+        {
+          history_data_publish(&history);
+          printf("[history] %s %s: %u points\r\n", history.symbol,
+                 history.range, (unsigned)history.point_count);
+        }
+      }
+      else
+      {
+        history_data_publish_error(&history_request, error);
+        printf("[history] %s %s failed: %s\r\n", history_request.symbol,
+               history_request.range, error);
+      }
+      continue;
+    }
+
     if (netif_is_up(&gnetif) && !ip4_addr_isany_val(*netif_ip4_addr(&gnetif)))
     {
       break;

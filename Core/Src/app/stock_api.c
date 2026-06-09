@@ -361,3 +361,73 @@ int stock_api_fetch_quote(const char *symbol, stock_snapshot_t *snapshot,
   cJSON_Delete(root);
   return 0;
 }
+
+int stock_api_fetch_history(const history_request_t *request,
+                            history_snapshot_t *snapshot,
+                            char *error, size_t error_size)
+{
+  char path[128];
+  snprintf(path, sizeof(path), "%s/history/%s?range=%s&limit=%u",
+           STOCK_API_BASE_PATH, request->symbol, request->range,
+           STOCK_SPARKLINE_MAX_POINTS);
+
+  char *body;
+  if (https_get(path, &body, error, error_size) != 0)
+  {
+    return -1;
+  }
+
+  cJSON *root = cJSON_Parse(body);
+  if (root == NULL)
+  {
+    snprintf(error, error_size, "JSON parse failed");
+    return -1;
+  }
+
+  cJSON *points = cJSON_GetObjectItemCaseSensitive(root, "points");
+  if (!cJSON_IsArray(points))
+  {
+    cJSON_Delete(root);
+    snprintf(error, error_size, "JSON missing history");
+    return -1;
+  }
+
+  memset(snapshot, 0, sizeof(*snapshot));
+  snprintf(snapshot->symbol, sizeof(snapshot->symbol), "%s", request->symbol);
+  snprintf(snapshot->range, sizeof(snapshot->range), "%s", request->range);
+  snapshot->generation = request->generation;
+  cJSON *interval = cJSON_GetObjectItemCaseSensitive(root, "interval");
+  if (cJSON_IsString(interval))
+  {
+    snprintf(snapshot->interval, sizeof(snapshot->interval), "%s",
+             interval->valuestring);
+  }
+
+  cJSON *point;
+  cJSON_ArrayForEach(point, points)
+  {
+    cJSON *last = cJSON_GetObjectItemCaseSensitive(point, "last");
+    cJSON *timestamp = cJSON_GetObjectItemCaseSensitive(point, "ts");
+    if (cJSON_IsNumber(last) && last->valuedouble > 0.0 &&
+        snapshot->point_count < STOCK_SPARKLINE_MAX_POINTS)
+    {
+      size_t index = snapshot->point_count++;
+      snapshot->closes[index] = (float)last->valuedouble;
+      if (cJSON_IsNumber(timestamp))
+      {
+        snapshot->timestamps[index] = (uint32_t)timestamp->valuedouble;
+      }
+    }
+  }
+  cJSON_Delete(root);
+
+  if (snapshot->point_count < 2U)
+  {
+    snprintf(error, error_size, "history has no data");
+    return -1;
+  }
+  snapshot->fresh = true;
+  snprintf(snapshot->status, sizeof(snapshot->status), "%s history via HTTPS",
+           request->range);
+  return 0;
+}

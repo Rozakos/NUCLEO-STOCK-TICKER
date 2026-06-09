@@ -79,8 +79,8 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
       then add DMA2D flush/double buffering.
 - [~] **M4 UI**: live quote snapshots update symbol, price, percentage, HTTPS status, and
       sparkline. Currently configured AMD-only. Tapping the AMD row opens a detail screen with
-      a full-width chart and range buttons. Range buttons respond to touch but history API
-      requests are not wired yet.
+      a full-width chart and range buttons. Range buttons asynchronously fetch and display real
+      `/history/{symbol}?range=...` data through the serialized TLS network task.
 - [ ] Later: web admin (LwIP httpd + settings on SD), WiFi as alternate netif.
 
 ## 6. NEXT ACTION (start here)
@@ -101,15 +101,19 @@ implements the STM32F746G-DISCO RMII MSP setup inside USER CODE 3 and calls
 instead of treating every failure as link-down.
 
 **DO THIS NEXT:**
-1. Flash the latest Debug build and tap the AMD row. Confirm it highlights while pressed and
-   opens the detail screen with the AMD logo, quote, chart, range buttons, and Back button.
-2. Compare the UART lines to verify touch coordinates and LVGL click delivery:
+1. Tap the AMD row and each range button. Confirm the chart and period percentage change after
+   the `Loading <range> history...` state. Expected UART:
    ```
    [touch] press x=<x> y=<y>
    [ui] row clicked: AMD
+   [ui] history range requested: 1mo
+   [history] fetching AMD 1mo...
+   [history] AMD 1mo: <n> points
    ```
-3. Tap a range button; the status line should show `History <range> selected`.
-4. Wire range buttons to `/history/{symbol}?range=...`.
+2. Web admin is verified at `http://192.168.1.154/` on the current DHCP lease. The current
+   address is always printed at boot as `[web] admin ready: http://<ip>/`.
+3. Next UI work: add chart axis/date labels and use `session_open`/`session_close` for a
+   progressive intraday chart.
 
 ### (done) Enabling LwIP in CubeMX — kept for reference
 Open `NUCLEO-STOCK-TICKER.ioc`:
@@ -141,6 +145,12 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-09 — Codex (GPT-5):** Wired detail range controls to real history API requests.
+  Added a thread-safe generation-based history request/result mailbox so LVGL never blocks on
+  HTTPS and stale responses cannot overwrite newer taps. The network task wakes immediately,
+  fetches `/history/{symbol}?range=...&limit=64`, parses `interval` and `{ts,last}` points, and
+  updates the detail chart and period percentage. Live API contract validated, Debug build
+  linked and flashed, and Web UI verified with HTTP 200 at `http://192.168.1.154/`.
 - **2026-06-09 — Codex (GPT-5):** Implemented list-to-detail navigation for the AMD ticker.
   Tapping the row now opens a dedicated LVGL screen with the bundled AMD logo, live price/change,
   a full-width chart based on the current quote sparkline, Back navigation, and visible

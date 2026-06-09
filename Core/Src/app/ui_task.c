@@ -1,6 +1,7 @@
 #include "app/ui_task.h"
 #include "app/config.h"
 #include "app/format.h"
+#include "app/history_data.h"
 #include "app/logos.h"
 #include "app/settings.h"
 #include "app/stock_data.h"
@@ -53,6 +54,7 @@ static lv_obj_t *detail_status;
 static lv_obj_t *selected_range_button;
 static char detail_symbol[APP_SYMBOL_LENGTH];
 static lv_point_precise_t detail_points[STOCK_SPARKLINE_MAX_POINTS];
+static uint32_t detail_history_generation;
 
 static void update_detail(void);
 static void create_detail_screen(const char *symbol);
@@ -87,9 +89,10 @@ static void range_clicked(lv_event_t *event)
   lv_obj_set_style_bg_color(button, lv_color_hex(0xED1C24), 0);
 
   char text[40];
-  snprintf(text, sizeof(text), "History %s selected", range);
+  snprintf(text, sizeof(text), "Loading %s history...", range);
   lv_label_set_text(detail_status, text);
-  printf("[ui] history range selected: %s\r\n", range);
+  detail_history_generation = history_data_request(detail_symbol, range);
+  printf("[ui] history range requested: %s\r\n", range);
 }
 
 static void display_flush(lv_display_t *display, const lv_area_t *area,
@@ -280,48 +283,87 @@ static void update_detail(void)
 {
   if (detail_screen == NULL) return;
 
-  stock_snapshot_t snapshot;
-  if (!stock_data_get(&snapshot) || !snapshot.fresh ||
-      strcmp(snapshot.symbol, detail_symbol) != 0)
+  stock_snapshot_t stocks[APP_MAX_SYMBOLS];
+  size_t stock_count = stock_data_get_all(stocks);
+  const stock_snapshot_t *snapshot = NULL;
+  for (size_t i = 0; i < stock_count; ++i)
+  {
+    if (stocks[i].fresh && strcmp(stocks[i].symbol, detail_symbol) == 0)
+    {
+      snapshot = &stocks[i];
+      break;
+    }
+  }
+  if (snapshot == NULL)
   {
     return;
   }
 
   char price[20], change[20], text[32];
-  format_decimal_2(price, sizeof(price), snapshot.last, 0);
-  format_decimal_2(change, sizeof(change), snapshot.change_pct, 1);
+  format_decimal_2(price, sizeof(price), snapshot->last, 0);
+  format_decimal_2(change, sizeof(change), snapshot->change_pct, 1);
   lv_label_set_text(detail_price, price);
   snprintf(text, sizeof(text), "%s %s%%",
-           snapshot.change_pct >= 0.0f ? LV_SYMBOL_UP : LV_SYMBOL_DOWN,
+           snapshot->change_pct >= 0.0f ? LV_SYMBOL_UP : LV_SYMBOL_DOWN,
            change);
   lv_label_set_text(detail_change, text);
-  lv_color_t accent = snapshot.change_pct >= 0.0f
+  lv_color_t accent = snapshot->change_pct >= 0.0f
       ? lv_color_hex(0x4ADE80) : lv_color_hex(0xF87171);
   lv_obj_set_style_text_color(detail_change, accent, 0);
 
-  if (snapshot.close_count < 2U)
+  const float *closes = snapshot->closes;
+  size_t point_count = snapshot->close_count;
+  history_snapshot_t history;
+  if (history_data_get(&history) &&
+      history.generation == detail_history_generation &&
+      strcmp(history.symbol, detail_symbol) == 0)
+  {
+    if (history.error)
+    {
+      lv_label_set_text(detail_status, history.status);
+    }
+    else if (history.fresh)
+    {
+      closes = history.closes;
+      point_count = history.point_count;
+      float period_change = (closes[point_count - 1U] - closes[0]) /
+                            closes[0] * 100.0f;
+      format_decimal_2(change, sizeof(change), period_change, 1);
+      snprintf(text, sizeof(text), "%s %s%%",
+               period_change >= 0.0f ? LV_SYMBOL_UP : LV_SYMBOL_DOWN, change);
+      lv_label_set_text(detail_change, text);
+      accent = period_change >= 0.0f
+          ? lv_color_hex(0x4ADE80) : lv_color_hex(0xF87171);
+      lv_obj_set_style_text_color(detail_change, accent, 0);
+      snprintf(text, sizeof(text), "%s: %u points", history.range,
+               (unsigned)history.point_count);
+      lv_label_set_text(detail_status, text);
+    }
+  }
+
+  if (point_count < 2U)
   {
     lv_line_set_points(detail_chart, detail_points, 0);
     return;
   }
 
-  float minimum = snapshot.closes[0];
-  float maximum = snapshot.closes[0];
-  for (size_t i = 1; i < snapshot.close_count; ++i)
+  float minimum = closes[0];
+  float maximum = closes[0];
+  for (size_t i = 1; i < point_count; ++i)
   {
-    if (snapshot.closes[i] < minimum) minimum = snapshot.closes[i];
-    if (snapshot.closes[i] > maximum) maximum = snapshot.closes[i];
+    if (closes[i] < minimum) minimum = closes[i];
+    if (closes[i] > maximum) maximum = closes[i];
   }
   float span = maximum - minimum;
   if (span < 0.001f) span = 1.0f;
-  for (size_t i = 0; i < snapshot.close_count; ++i)
+  for (size_t i = 0; i < point_count; ++i)
   {
     detail_points[i].x = (lv_value_precise_t)
-        ((i * (DETAIL_CHART_WIDTH - 2U)) / (snapshot.close_count - 1U));
+        ((i * (DETAIL_CHART_WIDTH - 2U)) / (point_count - 1U));
     detail_points[i].y = (lv_value_precise_t)
-        ((maximum - snapshot.closes[i]) * (DETAIL_CHART_HEIGHT - 8U) / span + 4.0f);
+        ((maximum - closes[i]) * (DETAIL_CHART_HEIGHT - 8U) / span + 4.0f);
   }
-  lv_line_set_points(detail_chart, detail_points, snapshot.close_count);
+  lv_line_set_points(detail_chart, detail_points, point_count);
   lv_obj_set_style_line_color(detail_chart, accent, 0);
 }
 
@@ -434,7 +476,12 @@ static void create_detail_screen(const char *symbol)
   lv_obj_set_style_line_width(detail_chart, 3, 0);
   lv_obj_set_style_line_rounded(detail_chart, true, 0);
 
-  static const char *ranges[] = { "1D", "1W", "1M", "6M", "1Y", "5Y", "Max" };
+  static const char *range_labels[] = {
+    "1D", "1W", "1M", "6M", "1Y", "5Y", "Max"
+  };
+  static const char *range_api[] = {
+    "1d", "1w", "1mo", "6mo", "1y", "5y", "max"
+  };
   lv_obj_t *range_row = lv_obj_create(detail_screen);
   lv_obj_set_size(range_row, LCD_WIDTH - 16, 30);
   lv_obj_align(range_row, LV_ALIGN_BOTTOM_MID, 0, 22);
@@ -445,10 +492,10 @@ static void create_detail_screen(const char *symbol)
   lv_obj_set_style_border_width(range_row, 0, 0);
   lv_obj_set_style_pad_all(range_row, 0, 0);
   lv_obj_clear_flag(range_row, LV_OBJ_FLAG_SCROLLABLE);
-  for (size_t i = 0; i < sizeof(ranges) / sizeof(ranges[0]); ++i)
+  for (size_t i = 0; i < sizeof(range_labels) / sizeof(range_labels[0]); ++i)
   {
-    lv_obj_t *button = create_text_button(range_row, ranges[i], range_clicked,
-                                          (void *)ranges[i]);
+    lv_obj_t *button = create_text_button(range_row, range_labels[i],
+                                          range_clicked, (void *)range_api[i]);
     if (i == 0U)
     {
       selected_range_button = button;
@@ -463,6 +510,8 @@ static void create_detail_screen(const char *symbol)
 
   update_detail();
   lv_screen_load(detail_screen);
+  detail_history_generation = history_data_request(detail_symbol, "1d");
+  lv_label_set_text(detail_status, "Loading 1d history...");
 }
 
 void StartUiTask(void const *argument)
