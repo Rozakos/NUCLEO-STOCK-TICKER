@@ -148,6 +148,17 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-09 — Claude (Opus 4.8, Claude Code):** Added company logos from the API (NOT yet
+  on-target tested). API (github.com/Rozakos/stock-api) serves logos only at GET /logo/{symbol}
+  ?size=32|48|64 as PNG (no logo field in the quote JSON; no raw RGB565 option). Chosen path:
+  decode PNG on-device. Enabled `LV_USE_LODEPNG`, moved LVGL heap+cache to SDRAM (LV_MEM_ADR
+  0xC0100000, 2 MB; LV_CACHE_DEF_SIZE 512 KB) so decode has room and logos aren't re-decoded each
+  frame. New `app/logo_cache.{c,h}` (per-symbol PNG slots in SDRAM @0xC0300000, thread-safe).
+  `stock_api`: `https_get` now returns body length (binary-safe) + `stock_api_fetch_logo`.
+  `net_task` fetches each symbol's logo once. `ui_task` shows the cached logo on rows (swapped in
+  by `update_rows` when ready) and the detail screen; colored-initial badge remains the fallback.
+  Reuses bundled AMD asset as AMD's immediate fallback. SDRAM map documented in lv_conf.h /
+  logo_cache.c. **NEXT: flash + verify `[logo] <sym> cached` lines and logos rendering.**
 - **2026-06-09 — Claude (Opus 4.8, Claude Code):** Fixed on-device blink + detail-screen layout.
   Root cause of blink (both market-list scroll and detail screen): LVGL rendered in DIRECT mode
   into the single live LTDC framebuffer. Switched to **double buffering** (FB0/FB1 in SDRAM;

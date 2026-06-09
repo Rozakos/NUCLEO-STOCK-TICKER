@@ -2,6 +2,7 @@
 #include "app/config.h"
 #include "app/format.h"
 #include "app/history_data.h"
+#include "app/logo_cache.h"
 #include "app/settings.h"
 #include "app/stock_api.h"
 #include "app/stock_data.h"
@@ -113,6 +114,25 @@ void StartNetTask(void const *argument)
       printf("[stock] %s fetch failed: %s\r\n", symbol, error);
     }
     stock_data_publish(&snapshot);
+
+    /* Fetch each symbol's logo once (PNG -> SDRAM cache; ui_task displays it). */
+    if (logo_cache_should_fetch(symbol))
+    {
+      const uint8_t *png = NULL;
+      size_t png_len = 0;
+      char logo_error[64];
+      if (stock_api_fetch_logo(symbol, &png, &png_len, logo_error,
+                               sizeof(logo_error)) == 0)
+      {
+        logo_cache_store(symbol, png, png_len);
+        printf("[logo] %s cached (%u bytes)\r\n", symbol, (unsigned)png_len);
+      }
+      else
+      {
+        logo_cache_mark_failed(symbol);
+        printf("[logo] %s logo failed: %s\r\n", symbol, logo_error);
+      }
+    }
 
     symbol_index = (symbol_index + 1U) % symbol_count;
     wait_for_refresh_or_settings(

@@ -2,6 +2,7 @@
 #include "app/config.h"
 #include "app/format.h"
 #include "app/history_data.h"
+#include "app/logo_cache.h"
 #include "app/logos.h"
 #include "app/settings.h"
 #include "app/stock_data.h"
@@ -43,6 +44,7 @@ typedef struct
   lv_obj_t *spark;
   lv_obj_t *price;
   lv_obj_t *change;
+  bool logo_applied;   /* true once a real logo (bundled or fetched) is shown */
   lv_point_precise_t points[STOCK_SPARKLINE_MAX_POINTS];
 } market_row_t;
 
@@ -148,6 +150,18 @@ static lv_color_t brand_color(const char *symbol)
 
 static void create_badge(market_row_t *market)
 {
+  const lv_image_dsc_t *api_logo = logo_cache_lookup(market->symbol);
+  if (api_logo != NULL)
+  {
+    market->badge = lv_image_create(market->row);
+    lv_image_set_src(market->badge, api_logo);
+    lv_image_set_scale(market->badge, 203);   /* 48px PNG -> 38px badge */
+    lv_obj_set_size(market->badge, 38, 38);
+    lv_obj_clear_flag(market->badge, LV_OBJ_FLAG_CLICKABLE);
+    market->logo_applied = true;
+    return;
+  }
+
   if (strcmp(market->symbol, "AMD") == 0)
   {
     market->badge = lv_image_create(market->row);
@@ -155,6 +169,7 @@ static void create_badge(market_row_t *market)
     lv_image_set_scale(market->badge, 203);
     lv_obj_set_size(market->badge, 38, 38);
     lv_obj_clear_flag(market->badge, LV_OBJ_FLAG_CLICKABLE);
+    market->logo_applied = true;
     return;
   }
 
@@ -270,6 +285,22 @@ static void update_rows(void)
 
   for (size_t row = 0; row < row_count; ++row)
   {
+    /* Swap the placeholder badge for the real logo once it has been fetched. */
+    if (!rows[row].logo_applied)
+    {
+      const lv_image_dsc_t *api_logo = logo_cache_lookup(rows[row].symbol);
+      if (api_logo != NULL)
+      {
+        lv_obj_delete(rows[row].badge);
+        rows[row].badge = lv_image_create(rows[row].row);
+        lv_image_set_src(rows[row].badge, api_logo);
+        lv_image_set_scale(rows[row].badge, 203);
+        lv_obj_set_size(rows[row].badge, 38, 38);
+        lv_obj_clear_flag(rows[row].badge, LV_OBJ_FLAG_CLICKABLE);
+        rows[row].logo_applied = true;
+      }
+    }
+
     const stock_snapshot_t *snapshot = NULL;
     for (size_t i = 0; i < stock_count; ++i)
     {
@@ -469,9 +500,16 @@ static void create_detail_screen(const char *symbol)
   /* Everything fits in 480x272 - never scroll the detail screen. */
   lv_obj_clear_flag(detail_screen, LV_OBJ_FLAG_SCROLLABLE);
 
-  /* AMD has a bundled logo; every other symbol gets a brand-colored badge with
-   * its initial (mirrors create_badge() for the market rows). */
-  if (strcmp(symbol, "AMD") == 0)
+  /* Prefer the fetched logo; fall back to the bundled AMD asset, then to a
+   * brand-colored initial badge (mirrors create_badge() for the market rows). */
+  const lv_image_dsc_t *api_logo = logo_cache_lookup(symbol);
+  if (api_logo != NULL)
+  {
+    lv_obj_t *logo = lv_image_create(detail_screen);
+    lv_image_set_src(logo, api_logo);
+    lv_obj_align(logo, LV_ALIGN_TOP_LEFT, 0, 0);
+  }
+  else if (strcmp(symbol, "AMD") == 0)
   {
     lv_obj_t *logo = lv_image_create(detail_screen);
     lv_image_set_src(logo, &logo_AMD);

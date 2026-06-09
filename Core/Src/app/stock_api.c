@@ -133,7 +133,7 @@ static int connect_socket(const char *host, uint16_t port, char *error,
   return socket_fd;
 }
 
-static int https_get(const char *path, char **body, char *error,
+static int https_get(const char *path, char **body, size_t *body_len, char *error,
                      size_t error_size)
 {
   int result = -1;
@@ -280,6 +280,10 @@ static int https_get(const char *path, char **body, char *error,
     goto cleanup;
   }
   *body += 4;
+  if (body_len != NULL)
+  {
+    *body_len = used - (size_t)(*body - HTTP_RESPONSE_ADDR);
+  }
   result = 0;
 
 cleanup:
@@ -315,7 +319,7 @@ int stock_api_fetch_quote(const char *symbol, stock_snapshot_t *snapshot,
   snprintf(path, sizeof(path), "%s/stock/%s", STOCK_API_BASE_PATH, symbol);
 
   char *body;
-  if (https_get(path, &body, error, error_size) != 0)
+  if (https_get(path, &body, NULL, error, error_size) != 0)
   {
     return -1;
   }
@@ -372,7 +376,7 @@ int stock_api_fetch_history(const history_request_t *request,
            STOCK_SPARKLINE_MAX_POINTS);
 
   char *body;
-  if (https_get(path, &body, error, error_size) != 0)
+  if (https_get(path, &body, NULL, error, error_size) != 0)
   {
     return -1;
   }
@@ -429,5 +433,29 @@ int stock_api_fetch_history(const history_request_t *request,
   snapshot->fresh = true;
   snprintf(snapshot->status, sizeof(snapshot->status), "%s history via HTTPS",
            request->range);
+  return 0;
+}
+
+int stock_api_fetch_logo(const char *symbol, const uint8_t **png,
+                         size_t *png_len, char *error, size_t error_size)
+{
+  char path[96];
+  snprintf(path, sizeof(path), "%s/logo/%s?size=48", STOCK_API_BASE_PATH, symbol);
+
+  char *body;
+  size_t len = 0;
+  if (https_get(path, &body, &len, error, error_size) != 0)
+  {
+    return -1;
+  }
+  /* PNG signature check: 89 50 4E 47 0D 0A 1A 0A */
+  if (len < 8U || (uint8_t)body[0] != 0x89U || body[1] != 'P' ||
+      body[2] != 'N' || body[3] != 'G')
+  {
+    snprintf(error, error_size, "not a PNG (%u bytes)", (unsigned)len);
+    return -1;
+  }
+  *png = (const uint8_t *)body;
+  *png_len = len;
   return 0;
 }
