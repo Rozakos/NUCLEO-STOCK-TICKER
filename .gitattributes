@@ -1,0 +1,13 @@
+# Normalize line endings to LF in the repo; check out native on each platform.
+* text=auto
+
+# Keep these LF always (toolchain/scripts)
+*.ld   text eol=lf
+*.s    text eol=lf
+*.c    text eol=lf
+*.h    text eol=lf
+
+# Treat firmware binaries as binary
+*.bin  binary
+*.hex  binary
+*.elf  binary

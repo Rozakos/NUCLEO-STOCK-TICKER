@@ -1635,6 +1635,14 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+/* Retarget printf()/stdout to USART1 (ST-Link Virtual COM Port, 115200 8N1).
+ * syscalls.c's _write() calls __io_putchar() for each byte. */
+int __io_putchar(int ch)
+{
+  HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+  return ch;
+}
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
