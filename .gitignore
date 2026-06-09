@@ -1,0 +1,23 @@
+# STM32CubeIDE build output
+/Debug/
+/Release/
+**/Debug/
+**/Release/
+
+# Build artifacts
+*.o
+*.d
+*.su
+*.elf
+*.list
+*.map
+*.bin
+*.hex
+*.a
+
+# Secrets (API base, bearer token, symbols) — never commit
+Core/Inc/app/secrets.h
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
