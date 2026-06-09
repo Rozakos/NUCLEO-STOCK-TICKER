@@ -74,9 +74,11 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
 - [x] **M2 HTTPS+JSON**: vendored STM32Cube F7 mbedTLS 2.16.2 and cJSON. HTTPS stock API client
       uses hardware RNG, bearer auth, SNI, and an SDRAM TLS allocation arena. Verified on target:
       AMD quote and sparkline data fetch successfully from `rozakos.eu`.
-- [~] **M3 Display**: SDRAM/LTDC/framebuffer and LVGL 9.5.0 verified on hardware. Added direct
-      FT5336 polling over I2C3 and registered it as an LVGL pointer device. Next: verify touch,
-      then add DMA2D flush/double buffering.
+- [x] **M3 Display**: SDRAM/LTDC/framebuffer + LVGL 9.5.0 + FT5336 touch verified on hardware.
+      Now **double-buffered** (two SDRAM framebuffers FB0=0xC0000000, FB1=0xC0080000; LVGL DIRECT
+      mode renders into the back buffer, `display_flush` swaps the LTDC address during vblank) —
+      fixes the full-screen blink on scroll / detail screen. (Optional later: LVGL DMA2D draw unit
+      for render accel.)
 - [~] **M4 UI**: live quote snapshots update symbol, price, percentage, HTTPS status, and
       sparkline. Now **multi-symbol** (default AMD, NVDA, AAPL, MSFT, TSLA; configurable via web
       admin up to APP_MAX_SYMBOLS=8). Tapping any row opens a detail screen (AMD shows its logo;
@@ -146,6 +148,15 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-09 — Claude (Opus 4.8, Claude Code):** Fixed on-device blink + detail-screen layout.
+  Root cause of blink (both market-list scroll and detail screen): LVGL rendered in DIRECT mode
+  into the single live LTDC framebuffer. Switched to **double buffering** (FB0/FB1 in SDRAM;
+  `display_flush` now swaps the LTDC base address during vblank via `HAL_LTDC_SetAddress`, timeout-
+  guarded vsync poll on `LTDC_CDSR_VSYNCS`). Detail screen overflowed 480x272 (range row aligned
+  BOTTOM_MID +22 = below the edge → forced scrolling); moved range row to -28 and status to -6,
+  reduced chart height 142→128, disabled detail-screen scrolling. Reviewed app modules for bugs —
+  no other real bugs found (TLS is single-fetcher so shared SDRAM buffers are safe; VERIFY_NONE is
+  the intended bring-up shortcut, CA pinning is a later item).
 - **2026-06-09 — Claude (Opus 4.8, Claude Code):** Wired all symbols into the UI (was AMD-only).
   The UI/net/web already handled multiple symbols — only the default list was AMD-only and the
   detail screen hard-coded `logo_AMD`. Set `config.h` default to AMD/NVDA/AAPL/MSFT/TSLA (5), and

@@ -17,15 +17,22 @@
 #include "main.h"
 
 #define FRAMEBUFFER_SIZE (LCD_WIDTH * LCD_HEIGHT * 2U)
+/* Two full framebuffers in SDRAM for tear-free double buffering. FB0 is the
+ * LTDC's initial buffer (0xC0000000). FB1 sits 512 KiB in, clear of FB0 and the
+ * TLS/HTTP/web buffers (which live at 0xC0040000..0xC006D000 in stock_api.c /
+ * web_task.c). LVGL renders into the back buffer; flush swaps the LTDC to it. */
+#define FRAMEBUFFER_0 ((void *)(LCD_FB_BASE_ADDR))
+#define FRAMEBUFFER_1 ((void *)(LCD_FB_BASE_ADDR + 0x00080000U))
 #define STATUS_HEIGHT 28
 #define ROW_HEIGHT 54
 #define ROW_GAP 5
 #define SPARK_WIDTH 150
 #define SPARK_HEIGHT 34
 #define DETAIL_CHART_WIDTH (LCD_WIDTH - 32)
-#define DETAIL_CHART_HEIGHT 142
+#define DETAIL_CHART_HEIGHT 128
 
 extern struct netif gnetif;
+extern LTDC_HandleTypeDef hltdc;
 
 typedef struct
 {
@@ -99,7 +106,23 @@ static void display_flush(lv_display_t *display, const lv_area_t *area,
                           uint8_t *pixels)
 {
   (void)area;
-  (void)pixels;
+  /* Double-buffered page flip: LVGL just finished rendering into `pixels`
+   * (the back buffer). Point the LTDC at it during vertical blanking so the
+   * swap is tear-free, then LVGL renders the next frame into the other buffer.
+   * The vblank wait is timeout-guarded so an unexpected status polarity
+   * degrades to an immediate swap instead of hanging the UI task. */
+  if (lv_display_flush_is_last(display))
+  {
+    uint32_t deadline = HAL_GetTick() + 20U;
+    while ((hltdc.Instance->CDSR & LTDC_CDSR_VSYNCS) == 0U)
+    {
+      if ((int32_t)(HAL_GetTick() - deadline) >= 0)
+      {
+        break;
+      }
+    }
+    HAL_LTDC_SetAddress(&hltdc, (uint32_t)pixels, 0U);
+  }
   lv_display_flush_ready(display);
 }
 
@@ -443,6 +466,8 @@ static void create_detail_screen(const char *symbol)
   lv_obj_set_style_bg_color(detail_screen, lv_color_hex(0x0B0F17), 0);
   lv_obj_set_style_bg_opa(detail_screen, LV_OPA_COVER, 0);
   lv_obj_set_style_pad_all(detail_screen, 8, 0);
+  /* Everything fits in 480x272 - never scroll the detail screen. */
+  lv_obj_clear_flag(detail_screen, LV_OBJ_FLAG_SCROLLABLE);
 
   /* AMD has a bundled logo; every other symbol gets a brand-colored badge with
    * its initial (mirrors create_badge() for the market rows). */
@@ -509,7 +534,7 @@ static void create_detail_screen(const char *symbol)
   };
   lv_obj_t *range_row = lv_obj_create(detail_screen);
   lv_obj_set_size(range_row, LCD_WIDTH - 16, 30);
-  lv_obj_align(range_row, LV_ALIGN_BOTTOM_MID, 0, 22);
+  lv_obj_align(range_row, LV_ALIGN_BOTTOM_MID, 0, -28);
   lv_obj_set_flex_flow(range_row, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(range_row, LV_FLEX_ALIGN_SPACE_BETWEEN,
                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -531,7 +556,7 @@ static void create_detail_screen(const char *symbol)
   detail_status = lv_label_create(detail_screen);
   lv_label_set_text(detail_status, "Live quote sparkline");
   lv_obj_set_style_text_color(detail_status, lv_color_hex(0x8A98AD), 0);
-  lv_obj_align(detail_status, LV_ALIGN_BOTTOM_MID, 0, 2);
+  lv_obj_align(detail_status, LV_ALIGN_BOTTOM_MID, 0, -6);
 
   update_detail();
   lv_screen_load(detail_screen);
@@ -547,7 +572,9 @@ void StartUiTask(void const *argument)
   lv_tick_set_cb(HAL_GetTick);
   lv_display_t *display = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
   lv_display_set_color_format(display, LV_COLOR_FORMAT_RGB565);
-  lv_display_set_buffers(display, (void *)LCD_FB_BASE_ADDR, NULL,
+  /* Clear the second framebuffer so the first flip can't show garbage. */
+  memset(FRAMEBUFFER_1, 0, FRAMEBUFFER_SIZE);
+  lv_display_set_buffers(display, FRAMEBUFFER_0, FRAMEBUFFER_1,
                          FRAMEBUFFER_SIZE, LV_DISPLAY_RENDER_MODE_DIRECT);
   lv_display_set_flush_cb(display, display_flush);
 
