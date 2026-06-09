@@ -1,29 +1,29 @@
-/**
- * net_task.c — M1 Ethernet bring-up.
- *
- * Sequence (all logged over USART1 @115200):
- *   1. wait for link up + DHCP-bound IPv4 address
- *   2. print IP / gateway / netmask
- *   3. resolve STOCK_API_HOST via DNS
- *   4. open a raw TCP connection to STOCK_API_PORT (443) and close it
- *
- * Proves the stack reaches the internet before mbedTLS (M2) is layered on.
- */
 #include "app/net_task.h"
 #include "app/config.h"
+#include "app/format.h"
+#include "app/settings.h"
+#include "app/stock_api.h"
+#include "app/stock_data.h"
 
 #include <stdio.h>
 #include <string.h>
 
-#include "lwip/netif.h"
 #include "lwip/ip4_addr.h"
-#include "lwip/api.h"        /* netconn_gethostbyname() */
-#include "lwip/sockets.h"
+#include "lwip/netif.h"
 
-/* Defined in LWIP/App/lwip.c */
 extern struct netif gnetif;
 
-/* Poll until the interface is up and DHCP has supplied a non-zero address. */
+static void wait_for_refresh_or_settings(uint32_t delay_ms,
+                                         uint32_t settings_seen)
+{
+  uint32_t start = osKernelSysTick();
+  while ((osKernelSysTick() - start) < delay_ms &&
+         settings_generation() == settings_seen)
+  {
+    osDelay(250);
+  }
+}
+
 static void net_wait_for_ip(void)
 {
   printf("[net] waiting for link + DHCP...\r\n");
@@ -36,59 +36,56 @@ static void net_wait_for_ip(void)
     osDelay(200);
   }
 
-  /* ip4addr_ntoa uses a shared static buffer, so print one at a time. */
   printf("[net] DHCP bound. IP  = %s\r\n", ip4addr_ntoa(netif_ip4_addr(&gnetif)));
   printf("[net]              GW  = %s\r\n", ip4addr_ntoa(netif_ip4_gw(&gnetif)));
   printf("[net]              MASK= %s\r\n", ip4addr_ntoa(netif_ip4_netmask(&gnetif)));
 }
 
-/* Resolve `host` and attempt a TCP connect to `port`. Returns 0 on success. */
-static int net_test_tcp(const char *host, uint16_t port)
-{
-  ip_addr_t addr;
-  err_t e = netconn_gethostbyname(host, &addr);
-  if (e != ERR_OK)
-  {
-    printf("[net] DNS resolve FAILED for %s (err=%d)\r\n", host, (int)e);
-    return -1;
-  }
-  printf("[net] DNS %s -> %s\r\n", host, ipaddr_ntoa(&addr));
-
-  int sock = socket(AF_INET, SOCK_STREAM, 0);
-  if (sock < 0)
-  {
-    printf("[net] socket() failed\r\n");
-    return -1;
-  }
-
-  struct sockaddr_in sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sin_family = AF_INET;
-  sa.sin_port = lwip_htons(port);
-  sa.sin_addr.s_addr = ip_addr_get_ip4_u32(&addr);
-
-  printf("[net] connecting to %s:%u ...\r\n", host, (unsigned)port);
-  if (connect(sock, (struct sockaddr *)&sa, sizeof(sa)) != 0)
-  {
-    printf("[net] TCP connect FAILED\r\n");
-    closesocket(sock);
-    return -1;
-  }
-
-  printf("[net] TCP connect OK (stack reaches the API host)\r\n");
-  closesocket(sock);
-  return 0;
-}
-
 void StartNetTask(void const *argument)
 {
   (void)argument;
+  char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
+  size_t symbol_count = settings_get_symbols(symbols);
+  size_t symbol_index = 0;
+  uint32_t settings_seen = settings_generation();
 
   net_wait_for_ip();
+  stock_api_init();
 
   for (;;)
   {
-    net_test_tcp(STOCK_API_HOST, STOCK_API_PORT);
-    osDelay(10000);   /* repeat every 10 s during bring-up */
+    if (settings_generation() != settings_seen)
+    {
+      symbol_count = settings_get_symbols(symbols);
+      symbol_index = 0;
+      settings_seen = settings_generation();
+      printf("[stock] symbols updated from web UI\r\n");
+    }
+
+    stock_snapshot_t snapshot = { 0 };
+    char error[96];
+    const char *symbol = symbols[symbol_index];
+
+    printf("[stock] fetching %s...\r\n", symbol);
+    if (stock_api_fetch_quote(symbol, &snapshot, error, sizeof(error)) == 0)
+    {
+      char price[20];
+      char change[20];
+      format_decimal_2(price, sizeof(price), snapshot.last, 0);
+      format_decimal_2(change, sizeof(change), snapshot.change_pct, 1);
+      printf("[stock] %s %s (%s%%), %u spark points\r\n",
+             snapshot.symbol, price, change,
+             (unsigned)snapshot.close_count);
+    }
+    else
+    {
+      snprintf(snapshot.symbol, sizeof(snapshot.symbol), "%s", symbol);
+      snprintf(snapshot.status, sizeof(snapshot.status), "%.47s", error);
+      printf("[stock] %s fetch failed: %s\r\n", symbol, error);
+    }
+    stock_data_publish(&snapshot);
+
+    symbol_index = (symbol_index + 1U) % symbol_count;
+    wait_for_refresh_or_settings(STOCK_REFRESH_MS / symbol_count, settings_seen);
   }
 }

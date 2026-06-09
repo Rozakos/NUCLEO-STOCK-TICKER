@@ -69,60 +69,47 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
 - [x] CubeMX skeleton (ETH MAC, LTDC 480×272 RGB565 FB @0xC0000000, FMC/SDRAM, DMA2D, SDMMC,
       FreeRTOS, FATFS, I2C1/I2C3, USART1).
 - [x] Git repo + `.gitignore`/`.gitattributes`, app config/secrets scaffolding, printf console, README.
-- [~] **M1 Ethernet** (on-target debugging in progress): LwIP enabled in CubeMX (DHCP, RTOS).
-      UART console CONFIRMED WORKING — board boots, LwIP inits, net task runs. DHCP was NOT
-      binding; root cause found + fixed (see below). **Awaiting re-test after the link-thread fix.**
-- [ ] **M2 HTTPS+JSON**: enable mbedTLS in CubeMX; `https_client.c` (mbedTLS/LwIP sockets) +
-      `stock_api.c` + cJSON → print parsed price/change for a symbol.
-- [ ] **M3 Display**: vendor LVGL 9.x + Disco BSP; `display.c` (LTDC+DMA2D flush, double buffer in
-      SDRAM), `touch_ft5336.c` (LVGL indev on I2C3); add SDRAM region to linker; LVGL tick.
-- [ ] **M4 UI**: price/change, sparkline (`lv_chart`), trend screen + range buttons, SD-card logos
-      (FATFS). Compile-time symbols from `config.h`; web admin later.
+- [x] **M1 Ethernet**: verified on hardware. Link up, DHCP bound (`192.168.1.154`), DNS resolved
+      `rozakos.eu`, and repeated TCP connects to port 443 succeeded.
+- [x] **M2 HTTPS+JSON**: vendored STM32Cube F7 mbedTLS 2.16.2 and cJSON. HTTPS stock API client
+      uses hardware RNG, bearer auth, SNI, and an SDRAM TLS allocation arena. Verified on target:
+      AMD quote and sparkline data fetch successfully from `rozakos.eu`.
+- [~] **M3 Display**: SDRAM/LTDC/framebuffer and LVGL 9.5.0 verified on hardware. Added direct
+      FT5336 polling over I2C3 and registered it as an LVGL pointer device. Next: verify touch,
+      then add DMA2D flush/double buffering.
+- [~] **M4 UI**: live quote snapshots update symbol, price, percentage, HTTPS status, and
+      sparkline. Currently configured AMD-only. Tapping the AMD row opens a detail screen with
+      a full-width chart and range buttons. Range buttons respond to touch but history API
+      requests are not wired yet.
 - [ ] Later: web admin (LwIP httpd + settings on SD), WiFi as alternate netif.
 
-## 6. NEXT ACTION (start here)  — for the next agent (Codex)
+## 6. NEXT ACTION (start here)
 
-**State as of last session (verified on hardware):** UART console works. After flash + reset
-the board prints:
+**M1 is verified complete.** On-target output:
 ```
-[main] boot OK - USART1 console alive @115200 8N1
-[boot] NUCLEO-STOCK-TICKER: LwIP up, starting net task
-[net] waiting for link + DHCP...      <-- got stuck here (no DHCP)
+[eth] link UP (100M/full)
+[net] DHCP bound. IP  = 192.168.1.154
+[net] DNS rozakos.eu -> 172.67.155.109
+[net] TCP connect OK (stack reaches the API host)
 ```
-Ethernet RJ45 green LED blinks (PHY link present). DHCP never bound.
 
-**Root cause (FIXED, needs re-test):** CubeMX generated `LWIP/Target/ethernetif.c` with an
-**empty `ethernet_link_thread()`** — it never detected PHY link, never called
-`HAL_ETH_Start_IT()`, so the ETH RX path never started and DHCP OFFERs were never received.
-Last session filled in the link thread (USER CODE block): reads LAN8742 BMSR (reg 1) link bit,
-on link-up reads PSCSR (reg 31) for speed/duplex, calls `HAL_ETH_SetMACConfig` +
-`HAL_ETH_Start_IT` + `netif_set_link_up` (and prints `[eth] link UP (100M/full)`); on link-down
-stops + `netif_set_link_down`. PHY_ADDRESS=0. The RX `HAL_ETH_Rx*Callback`s are weak HAL
-overrides (no registration needed) — already present and correct.
+**M1 root cause (FIXED and verified):** CubeMX generated no project
+`HAL_ETH_MspInit()` override. `HAL_ETH_Init()` therefore called the HAL weak no-op, leaving
+ETH clocks, RMII GPIO alternate functions, and the ETH IRQ unconfigured. `ethernetif.c` now
+implements the STM32F746G-DISCO RMII MSP setup inside USER CODE 3 and calls
+`HAL_ETH_SetMDIOClockRange()` after HAL init. PHY reads now report MDIO failures explicitly
+instead of treating every failure as link-down.
 
 **DO THIS NEXT:**
-1. Rebuild + flash + reset. Watch UART. EXPECT now:
+1. Flash the latest Debug build and tap the AMD row. Confirm it highlights while pressed and
+   opens the detail screen with the AMD logo, quote, chart, range buttons, and Back button.
+2. Compare the UART lines to verify touch coordinates and LVGL click delivery:
    ```
-   [eth] link UP (100M/full)
-   [net] DHCP bound. IP  = 192.168.x.x
-   [net] DNS rozakos.eu -> <ip>
-   [net] TCP connect OK (stack reaches the API host)
+   [touch] press x=<x> y=<y>
+   [ui] row clicked: AMD
    ```
-2. If `[eth] link UP` prints but DHCP still fails → RX path issue. Check `HAL_ETH_ReadData`
-   actually returns frames; verify RX_POOL (`ETH_RX_BUFFER_CNT`) and that pbufs are freed.
-   With D-cache OFF the `SCB_InvalidateDCache_by_Addr` in `HAL_ETH_RxLinkCallback` is a no-op
-   (fine). Try a static IP (`config.h` NET_USE_DHCP=0 path is NOT wired in net_task yet — would
-   need adding) to isolate DHCP vs RX.
-3. If `[eth] link UP` never prints → PHY read issue: confirm PHY addr (0), that `HAL_ETH_Init`
-   succeeded (else `Error_Handler`), MDIO clock. Consider using ST's `lan8742.c` driver from the
-   FW package instead of raw PHY reg reads.
-4. Once `TCP connect OK` shows → **M1 DONE**, commit, move to **M2 (mbedTLS HTTPS + cJSON)**:
-   enable mbedTLS in CubeMX (raise FreeRTOS heap + netTask stack a lot — TLS is heavy), write
-   `app/https_client.c` (mbedTLS over LwIP sockets, `TLS_INSECURE_SKIP_VERIFY` first) +
-   `app/stock_api.c` + vendored cJSON; GET `/stocks/api/v1/stock/AAPL` with
-   `Authorization: Bearer <STOCK_API_TOKEN>` and print parsed price/change.
-
-### (done) Enabling LwIP in CubeMX — kept for reference
+3. Tap a range button; the status line should show `History <range> selected`.
+4. Wire range buttons to `/history/{symbol}?range=...`.
 
 ### (done) Enabling LwIP in CubeMX — kept for reference
 Open `NUCLEO-STOCK-TICKER.ioc`:
@@ -154,6 +141,46 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-09 — Codex (GPT-5):** Implemented list-to-detail navigation for the AMD ticker.
+  Tapping the row now opens a dedicated LVGL screen with the bundled AMD logo, live price/change,
+  a full-width chart based on the current quote sparkline, Back navigation, and visible
+  `1D/1W/1M/6M/1Y/5Y/Max` range controls. Range selection updates the screen and UART; fetching
+  distinct history datasets remains the next API task. Debug build linked successfully.
+- **2026-06-09 — Codex (GPT-5):** Ported the original bundled AMD 48×48 ARGB8888
+  LVGL asset without adding a PNG decoder. AMD rows now show the native logo, visibly
+  highlight while pressed, and report clicks in both the status bar and UART. FT5336 input
+  now logs one transformed coordinate line per new press. Debug build linked successfully;
+  next on-target check is to confirm the logo renders and compare `[touch] press x=... y=...`
+  with `[ui] row clicked: AMD`.
+- **2026-06-09 — Codex (GPT-5):** Fixed live HTTPS data fetching and switched configuration to
+  AMD-only. COM4 showed Cloudflare fatal TLS alerts because SNI was compiled out; enabling SNI
+  exposed a certificate-chain curve parse error, fixed by enabling P-384/SHA-384 support.
+  HTTPS then succeeded. Added embedded-safe fixed-point formatting because newlib-nano omits
+  `%f` support. Rebuilt, flashed, and verified on COM4:
+  `[stock] AMD 490.33 (+5.14%), 5 spark points`.
+- **2026-06-09 — Codex (GPT-5):** Started the full functional port after LVGL verification.
+  Read the original CYD API behavior; vendored mbedTLS 2.16.2 and cJSON; implemented hardware-RNG
+  TLS, HTTP/1.0 bearer-auth quote fetching, cJSON parsing, thread-safe stock snapshots, live LVGL
+  price/change/sparkline updates, and direct FT5336 touch input on I2C3. TLS heap and HTTP buffer
+  live in SDRAM beyond the framebuffer. Combined build linked at about 827 KiB and was flashed.
+  COM4 remains occupied by MobaXterm, so live quote/touch confirmation is pending.
+- **2026-06-09 — Codex (GPT-5):** User visually confirmed the stable eight-color-bar test,
+  proving SDRAM initialization, LTDC, panel timing, and the RGB565 framebuffer work. Vendored
+  LVGL 9.5.0, added a direct-framebuffer display driver and first stock-ticker placeholder UI,
+  increased the FreeRTOS heap to 128 KiB, built successfully, and flashed the board. Awaiting
+  visual confirmation of the LVGL screen.
+- **2026-06-09 — Codex (GPT-5):** User confirmed the M1 MSP fix fully works: link, DHCP, DNS,
+  and repeated TCP connections to `rozakos.eu:443` succeeded. Switched to graphics. Confirmed
+  CubeMX LTDC timings match the RK043FN48H BSP, found the mandatory SDRAM device initialization
+  sequence was missing, and added `app/display.{c,h}` to initialize/verify SDRAM and draw an
+  RGB565 color-bar test pattern. Clean Debug build passed with zero warnings and was flashed.
+  Awaiting visual/UART confirmation before adding LVGL.
+- **2026-06-09 — Codex (GPT-5):** Continued M1 on-target debugging after UART reported
+  `[eth] link DOWN`. Found CubeMX had omitted `HAL_ETH_MspInit()` entirely, so the HAL weak
+  no-op left ETH clocks/RMII GPIOs/IRQ unconfigured. Added STM32F746G-DISCO RMII MSP setup in
+  `ethernetif.c` USER CODE, configured the MDIO clock divider, and added explicit PHY-read error
+  logging. Debug build passed; DMA descriptors confirmed in RAM; firmware flashed successfully.
+  COM4 capture was blocked by the user's open MobaXterm session; next step is inspect its output.
 - **2026-06-09 — Claude (Opus 4.8, Claude Code):** git init + ignore/attributes; `Core/Inc/app/`
   `config.h` + `secrets.h(.example)`; printf→USART1 retarget in `main.c`; `README.md`; this
   `AGENTS.md`. Decided CubeMX route for LwIP/mbedTLS. Pushed to GitHub.

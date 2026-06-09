@@ -129,6 +129,10 @@
 
 /* Give the netconn/socket API a bit more headroom for the HTTPS client later. */
 #define MEM_SIZE                (16 * 1024)
+#undef  MEMP_NUM_NETCONN
+#define MEMP_NUM_NETCONN        8
+#undef  MEMP_NUM_TCP_PCB
+#define MEMP_NUM_TCP_PCB        8
 /* USER CODE END 1 */
 
 #ifdef __cplusplus

@@ -26,7 +26,11 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include "app/display.h"
 #include "app/net_task.h"
+#include "app/settings.h"
+#include "app/ui_task.h"
+#include "app/web_task.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -188,6 +192,8 @@ int main(void)
     static const char boot_msg[] = "\r\n[main] boot OK - USART1 console alive @115200 8N1\r\n";
     HAL_UART_Transmit(&huart1, (uint8_t *)boot_msg, sizeof(boot_msg) - 1, HAL_MAX_DELAY);
   }
+  display_init();
+  settings_init();
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
@@ -1597,11 +1603,15 @@ void StartDefaultTask(void const * argument)
   /* USER CODE BEGIN 5 */
   printf("\r\n[boot] NUCLEO-STOCK-TICKER: LwIP up, starting net task\r\n");
 
-  /* Start the M1 networking task now that LwIP is initialized.
-   * Stack is in CMSIS-RTOS v1 words; 1024 (=4 KB) is ample for DHCP/DNS/TCP.
-   * (mbedTLS in M2 will need a much larger stack.) */
-  osThreadDef(netTask, StartNetTask, osPriorityNormal, 0, 1024);
+  /* TLS handshakes use a deep call stack on Cortex-M7. */
+  osThreadDef(netTask, StartNetTask, osPriorityNormal, 0, 4096);
   osThreadCreate(osThread(netTask), NULL);
+
+  osThreadDef(uiTask, StartUiTask, osPriorityNormal, 0, 2048);
+  osThreadCreate(osThread(uiTask), NULL);
+
+  osThreadDef(webTask, StartWebTask, osPriorityBelowNormal, 0, 1024);
+  osThreadCreate(osThread(webTask), NULL);
 
   /* Infinite loop */
   for(;;)

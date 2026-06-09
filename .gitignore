@@ -21,3 +21,8 @@ Core/Inc/app/secrets.h
 # OS / editor cruft
 Thumbs.db
 .DS_Store
+
+# Local build and HTTP diagnostic captures
+/*.log
+/web-*.html
+/web-headers.txt

@@ -146,6 +146,45 @@ static void RMII_Thread( void const * argument );
 
 /* USER CODE BEGIN 3 */
 
+/**
+  * @brief Initialize ETH clocks, RMII pins, and interrupt.
+  * @note CubeMX leaves this BSP-specific hook for the application.
+  */
+void HAL_ETH_MspInit(ETH_HandleTypeDef *ethHandle)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  if (ethHandle->Instance != ETH)
+  {
+    return;
+  }
+
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOG_CLK_ENABLE();
+  __HAL_RCC_ETH_CLK_ENABLE();
+
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF11_ETH;
+
+  /* PA1=REF_CLK, PA2=MDIO, PA7=CRS_DV */
+  GPIO_InitStruct.Pin = GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_7;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* PC1=MDC, PC4=RXD0, PC5=RXD1 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1 | GPIO_PIN_4 | GPIO_PIN_5;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /* PG2=RXER, PG11=TX_EN, PG13=TXD0, PG14=TXD1 */
+  GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_11 | GPIO_PIN_13 | GPIO_PIN_14;
+  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
+
+  HAL_NVIC_SetPriority(ETH_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(ETH_IRQn);
+}
+
 /* USER CODE END 3 */
 
 /* Private functions ---------------------------------------------------------*/
@@ -283,7 +322,9 @@ static void low_level_init(struct netif *netif)
   if (hal_eth_init_status == HAL_OK)
   {
 /* USER CODE BEGIN low_level_init Code 2 for User BSP */
-
+    /* HAL_ETH_Init does not configure the MDC divider. */
+    HAL_ETH_SetMDIOClockRange(&heth);
+    printf("[eth] MAC/RMII initialized\r\n");
 /* USER CODE END low_level_init Code 2 for User BSP */
 
   }
@@ -577,12 +618,30 @@ void ethernet_link_thread(void const * argument)
     {
       struct netif *netif = (struct netif *)argument;
       static uint8_t link_prev = 0xFFU;   /* force an update on first pass */
+      static uint8_t phy_read_error_reported = 0U;
       uint32_t bsr = 0U;
       uint8_t link_now;
+      HAL_StatusTypeDef read_status;
 
       /* BMSR link-status bit is latched-low: read twice for current state. */
-      HAL_ETH_ReadPHYRegister(&heth, PHY_ADDRESS, PHY_BSR_REG, &bsr);
-      HAL_ETH_ReadPHYRegister(&heth, PHY_ADDRESS, PHY_BSR_REG, &bsr);
+      read_status = HAL_ETH_ReadPHYRegister(&heth, PHY_ADDRESS, PHY_BSR_REG, &bsr);
+      if (read_status == HAL_OK)
+      {
+        read_status = HAL_ETH_ReadPHYRegister(&heth, PHY_ADDRESS, PHY_BSR_REG, &bsr);
+      }
+
+      if (read_status != HAL_OK)
+      {
+        if (!phy_read_error_reported)
+        {
+          printf("[eth] PHY MDIO read FAILED (status=%d, error=0x%08lx)\r\n",
+                 (int)read_status, (unsigned long)HAL_ETH_GetError(&heth));
+          phy_read_error_reported = 1U;
+        }
+        osDelay(1000);
+        continue;
+      }
+      phy_read_error_reported = 0U;
       link_now = (bsr & PHY_BSR_LINK_STATUS) ? 1U : 0U;
 
       if (link_now != link_prev)

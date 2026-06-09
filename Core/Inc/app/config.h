@@ -16,8 +16,8 @@
 #define LCD_FB_BASE_ADDR      0xC0000000U
 
 /* ---- Symbols to track (compile-time for now; runtime/web admin later) -- */
-#define STOCK_SYMBOLS         { "AAPL", "MSFT", "NVDA", "TSLA", "GOOGL" }
-#define STOCK_SYMBOL_COUNT    5
+#define STOCK_SYMBOLS         { "AMD" }
+#define STOCK_SYMBOL_COUNT    1
 
 /* Default history range for the trend screen: 1D 1W 1M 6M 1Y 5Y Max */
 #define STOCK_DEFAULT_RANGE   "1D"
