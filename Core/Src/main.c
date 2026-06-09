@@ -121,6 +121,7 @@ static void MX_USART6_UART_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
+static void MPU_Config_SDRAM(void);
 
 /* USER CODE END PFP */
 
@@ -137,6 +138,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+  MPU_Config_SDRAM();
 
   /* USER CODE END 1 */
 
@@ -1575,6 +1577,25 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+static void MPU_Config_SDRAM(void)
+{
+  MPU_Region_InitTypeDef region = { 0 };
+
+  HAL_MPU_Disable();
+  region.Enable = MPU_REGION_ENABLE;
+  region.Number = MPU_REGION_NUMBER0;
+  region.BaseAddress = 0xC0000000U;
+  region.Size = MPU_REGION_SIZE_8MB;
+  region.SubRegionDisable = 0x00U;
+  region.TypeExtField = MPU_TEX_LEVEL1;
+  region.AccessPermission = MPU_REGION_FULL_ACCESS;
+  region.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
+  region.IsShareable = MPU_ACCESS_NOT_SHAREABLE;
+  region.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  region.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+  HAL_MPU_ConfigRegion(&region);
+  HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+}
 
 /* Retarget printf()/stdout to USART1 (ST-Link Virtual COM Port, 115200 8N1).
  * syscalls.c's _write() calls __io_putchar() for each byte. */

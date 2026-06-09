@@ -18,7 +18,7 @@
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
 
-#include "tls_ca_cert.c"
+#include "app/tls_ca_cert_data.h"
 
 #define TLS_HEAP_ADDR       ((unsigned char *)0xC0040000U)
 #define TLS_HEAP_SIZE       (128U * 1024U)

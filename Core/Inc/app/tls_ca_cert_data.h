@@ -1,3 +1,6 @@
+#ifndef APP_TLS_CA_CERT_DATA_H
+#define APP_TLS_CA_CERT_DATA_H
+
 /* Google Trust Services WE1 intermediate, valid through 2029-02-20. */
 static const char tls_ca_cert_pem[] =
     "-----BEGIN CERTIFICATE-----\n"
@@ -17,3 +20,5 @@ static const char tls_ca_cert_pem[] =
     "sQIwJonMaAFi54mrfhfoFNZEfuNMSQ6/bIBiNLiyoX46FohQvKeIoJ99cx7sUkFN\n"
     "7uJW\n"
     "-----END CERTIFICATE-----\n";
+
+#endif /* APP_TLS_CA_CERT_DATA_H */

@@ -153,6 +153,13 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-09 - Codex (GPT-5):** Restored fetched PNG logo decoding by fixing the actual
+  external-LVGL-heap root cause. Cortex-M7's default map treated `0xC0000000` SDRAM as Device
+  memory, where LVGL TLSF's normal/unaligned accesses stalled. Added an 8 MiB normal
+  non-cacheable MPU region before HAL initialization, then re-enabled the 2 MiB SDRAM LVGL
+  heap, 512 KiB image cache, and lodepng. Clean-built, flashed, and verified full UI startup,
+  pinned-TLS quote fetches, and multiple cached logos without a stall.
+
 - **2026-06-09 - Codex (GPT-5):** Enabled required TLS certificate verification. Inspected the
   live `rozakos.eu` chain, pinned the Google Trust Services WE1 intermediate (valid through
   2029-02-20), enabled PEM/base64 parsing, and changed the default from `VERIFY_NONE` to
