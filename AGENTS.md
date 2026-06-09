@@ -78,9 +78,10 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
       FT5336 polling over I2C3 and registered it as an LVGL pointer device. Next: verify touch,
       then add DMA2D flush/double buffering.
 - [~] **M4 UI**: live quote snapshots update symbol, price, percentage, HTTPS status, and
-      sparkline. Currently configured AMD-only. Tapping the AMD row opens a detail screen with
-      a full-width chart and range buttons. Range buttons asynchronously fetch and display real
-      `/history/{symbol}?range=...` data through the serialized TLS network task.
+      sparkline. Now **multi-symbol** (default AMD, NVDA, AAPL, MSFT, TSLA; configurable via web
+      admin up to APP_MAX_SYMBOLS=8). Tapping any row opens a detail screen (AMD shows its logo;
+      others show a brand-colored initial badge) with a full-width chart and range buttons that
+      asynchronously fetch real `/history/{symbol}?range=...` data via the serialized TLS task.
 - [ ] Later: web admin (LwIP httpd + settings on SD), WiFi as alternate netif.
 
 ## 6. NEXT ACTION (start here)
@@ -145,6 +146,11 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-09 — Claude (Opus 4.8, Claude Code):** Wired all symbols into the UI (was AMD-only).
+  The UI/net/web already handled multiple symbols — only the default list was AMD-only and the
+  detail screen hard-coded `logo_AMD`. Set `config.h` default to AMD/NVDA/AAPL/MSFT/TSLA (5), and
+  made `create_detail_screen` show a brand-colored initial badge for non-AMD (AMD keeps its logo),
+  mirroring `create_badge`. Verified no other AMD hardcodes remain. **Not yet on-target verified.**
 - **2026-06-09 — Claude (Opus 4.8, Claude Code):** Reviewed Codex's uncommitted web-admin work
   (runtime symbol add/delete + refresh-interval via POST forms; `receive_request`/`form_value`
   HTTP parsing; multi-symbol rotation in `net_task`). Found + fixed a **webTask stack overflow**:

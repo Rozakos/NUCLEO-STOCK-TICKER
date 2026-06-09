@@ -444,9 +444,32 @@ static void create_detail_screen(const char *symbol)
   lv_obj_set_style_bg_opa(detail_screen, LV_OPA_COVER, 0);
   lv_obj_set_style_pad_all(detail_screen, 8, 0);
 
-  lv_obj_t *logo = lv_image_create(detail_screen);
-  lv_image_set_src(logo, &logo_AMD);
-  lv_obj_align(logo, LV_ALIGN_TOP_LEFT, 0, 0);
+  /* AMD has a bundled logo; every other symbol gets a brand-colored badge with
+   * its initial (mirrors create_badge() for the market rows). */
+  if (strcmp(symbol, "AMD") == 0)
+  {
+    lv_obj_t *logo = lv_image_create(detail_screen);
+    lv_image_set_src(logo, &logo_AMD);
+    lv_obj_align(logo, LV_ALIGN_TOP_LEFT, 0, 0);
+  }
+  else
+  {
+    lv_obj_t *badge = lv_obj_create(detail_screen);
+    lv_obj_set_size(badge, 48, 48);
+    lv_obj_set_style_radius(badge, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(badge, brand_color(symbol), 0);
+    lv_obj_set_style_border_width(badge, 0, 0);
+    lv_obj_set_style_pad_all(badge, 0, 0);
+    lv_obj_clear_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(badge, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    char initial[2] = { symbol[0], '\0' };
+    lv_obj_t *badge_label = lv_label_create(badge);
+    lv_label_set_text(badge_label, initial);
+    lv_obj_set_style_text_color(badge_label, lv_color_hex(0x0B0F17), 0);
+    lv_obj_set_style_text_font(badge_label, &lv_font_montserrat_20, 0);
+    lv_obj_center(badge_label);
+  }
 
   lv_obj_t *symbol_label = lv_label_create(detail_screen);
   lv_label_set_text(symbol_label, symbol);
