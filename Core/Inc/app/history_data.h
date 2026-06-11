@@ -25,6 +25,10 @@ typedef struct
   char interval[HISTORY_INTERVAL_LENGTH];
   float closes[STOCK_SPARKLINE_MAX_POINTS];
   uint32_t timestamps[STOCK_SPARKLINE_MAX_POINTS];
+  /* Trading-session bounds for the 1d range (0 when the API omits them);
+   * the UI uses these to draw the progressive intraday chart. */
+  uint32_t session_open;
+  uint32_t session_close;
   size_t point_count;
   uint32_t generation;
   bool fresh;

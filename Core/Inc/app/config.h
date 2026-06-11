@@ -22,6 +22,11 @@
 /* Default history range for the trend screen: 1D 1W 1M 6M 1Y 5Y Max */
 #define STOCK_DEFAULT_RANGE   "1D"
 
+/* ---- Time display -------------------------------------------------------
+ * No RTC/timezone database: chart axis times are epoch + this fixed offset
+ * (minutes east of UTC). 180 = EEST (Athens summer time). */
+#define APP_UTC_OFFSET_MINUTES 180
+
 /* ---- Refresh cadence ---------------------------------------------------- */
 #define STOCK_REFRESH_MS      (60U * 1000U)   /* poll each symbol every 60 s */
 

@@ -433,6 +433,16 @@ int stock_api_fetch_history(const history_request_t *request,
     snprintf(snapshot->interval, sizeof(snapshot->interval), "%s",
              interval->valuestring);
   }
+  cJSON *session_open = cJSON_GetObjectItemCaseSensitive(root, "session_open");
+  if (cJSON_IsNumber(session_open))
+  {
+    snapshot->session_open = (uint32_t)session_open->valuedouble;
+  }
+  cJSON *session_close = cJSON_GetObjectItemCaseSensitive(root, "session_close");
+  if (cJSON_IsNumber(session_close))
+  {
+    snapshot->session_close = (uint32_t)session_close->valuedouble;
+  }
 
   cJSON *point;
   cJSON_ArrayForEach(point, points)

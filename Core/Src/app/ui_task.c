@@ -1,4 +1,5 @@
 #include "app/ui_task.h"
+#include "app/chart_util.h"
 #include "app/config.h"
 #include "app/format.h"
 #include "app/history_data.h"
@@ -8,6 +9,7 @@
 #include "app/stock_data.h"
 #include "app/touch_ft5336.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -29,8 +31,26 @@
 #define ROW_GAP 5
 #define SPARK_WIDTH 150
 #define SPARK_HEIGHT 34
-#define DETAIL_CHART_WIDTH (LCD_WIDTH - 32)
-#define DETAIL_CHART_HEIGHT 128
+
+/* Detail screen layout (CYD detail_screen port, scaled to 480x272).
+ * Screen pad 8 -> 464x256 content: header row, range-button row, then a
+ * card holding the chart plus its Y-label gutter and X-label strip. */
+#define DETAIL_PAD 8
+#define DETAIL_CONTENT_W (LCD_WIDTH - 2 * DETAIL_PAD)
+#define DETAIL_HEADER_H 40
+#define DETAIL_BTN_ROW_H 26
+#define DETAIL_CARD_Y (DETAIL_HEADER_H + 2 + DETAIL_BTN_ROW_H + 2)
+#define DETAIL_CARD_H (LCD_HEIGHT - 2 * DETAIL_PAD - DETAIL_CARD_Y)
+#define DETAIL_CARD_PAD 8
+#define DETAIL_CHART_W (DETAIL_CONTENT_W - 2 * DETAIL_CARD_PAD)
+#define DETAIL_CHART_H (DETAIL_CARD_H - 2 * DETAIL_CARD_PAD)
+#define DETAIL_MAX_Y_TICKS 8
+#define DETAIL_X_TICKS 4
+/* Monotone-cubic smoothing density: output samples per input segment. */
+#define DETAIL_CR_FACTOR 5
+#define DETAIL_CR_MAX_OUT ((STOCK_SPARKLINE_MAX_POINTS - 1U) * DETAIL_CR_FACTOR + 1U)
+#define DETAIL_MARKER_SIZE 8
+#define DETAIL_NUM_RANGES 7
 
 extern struct netif gnetif;
 extern LTDC_HandleTypeDef hltdc;
@@ -56,14 +76,49 @@ static lv_obj_t *link_label;
 static lv_obj_t *updated_label;
 static lv_obj_t *market_screen;
 static lv_obj_t *detail_screen;
+static lv_obj_t *detail_card;
 static lv_obj_t *detail_price;
 static lv_obj_t *detail_change;
 static lv_obj_t *detail_chart;
-static lv_obj_t *detail_status;
-static lv_obj_t *selected_range_button;
+static lv_chart_series_t *detail_series;
+static lv_obj_t *detail_spinner;
+static lv_obj_t *detail_error_label;
+static lv_obj_t *detail_marker;
+static lv_obj_t *detail_y_labels[DETAIL_MAX_Y_TICKS];
+static lv_obj_t *detail_x_labels[DETAIL_X_TICKS];
+static lv_obj_t *detail_range_buttons[DETAIL_NUM_RANGES];
 static char detail_symbol[APP_SYMBOL_LENGTH];
-static lv_point_precise_t detail_points[STOCK_SPARKLINE_MAX_POINTS];
-static uint32_t detail_history_generation;
+static uint32_t detail_history_generation;  /* generation of the in-flight request */
+static uint32_t detail_done_generation;     /* last generation rendered or errored */
+static bool detail_window_rendered;         /* a history window is on the chart */
+/* detail_range_displayed = range whose data is on the chart;
+ * detail_range_pending = range the user last tapped (highlight follows the
+ * tap instantly, data catches up when the fetch lands). */
+static int detail_range_displayed;
+static int detail_range_pending;
+static lv_color_t detail_line_color;
+
+/* Geometry handed to the gradient area-fill draw callback (chart-local). */
+static int detail_fill_n;
+static int32_t detail_fill_x[DETAIL_CR_MAX_OUT];
+static int32_t detail_fill_y[DETAIL_CR_MAX_OUT];
+static int32_t detail_fill_bottom;
+
+/* Button label i shows range_labels[i]; the API gets range_api[i]. */
+static const char *range_labels[DETAIL_NUM_RANGES] = {
+  "1D", "1W", "1M", "6M", "1Y", "5Y", "Max"
+};
+static const char *range_api[DETAIL_NUM_RANGES] = {
+  "1d", "1w", "1mo", "6mo", "1y", "5y", "max"
+};
+static const char *month_names[12] = {
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+};
+/* Y-axis tick steps; pick the smallest giving <= 5 intervals. */
+static const float y_steps[] = {
+  0.1f, 0.2f, 0.5f, 1, 2, 5, 10, 20, 25, 50, 100, 200, 500, 1000, 2000, 5000
+};
 
 static void update_detail(void);
 static void create_detail_screen(const char *symbol);
@@ -81,27 +136,69 @@ static void back_clicked(lv_event_t *event)
   lv_screen_load(market_screen);
   lv_obj_delete_async(detail_screen);
   detail_screen = NULL;
+  detail_card = NULL;
   detail_chart = NULL;
-  detail_status = NULL;
-  selected_range_button = NULL;
+  detail_series = NULL;
+  detail_spinner = NULL;
+  detail_error_label = NULL;
+  detail_marker = NULL;
+  memset(detail_range_buttons, 0, sizeof(detail_range_buttons));
+}
+
+/* Highlight the pending (just-tapped) range button with the chart accent;
+ * mute the rest. Tracking the PENDING index means the highlight acknowledges
+ * the tap instantly, before the fetch completes. */
+static void apply_range_styles(void)
+{
+  for (int i = 0; i < DETAIL_NUM_RANGES; ++i)
+  {
+    lv_obj_t *button = detail_range_buttons[i];
+    if (button == NULL) continue;
+    if (i == detail_range_pending)
+    {
+      lv_obj_set_style_bg_color(button, detail_line_color, 0);
+      lv_obj_set_style_text_color(button, lv_color_hex(0x0B0F17), 0);
+    }
+    else
+    {
+      lv_obj_set_style_bg_color(button, lv_color_hex(0x263244), 0);
+      lv_obj_set_style_text_color(button, lv_color_hex(0xE7EEF7), 0);
+    }
+  }
+}
+
+/* Blank the chart and pop the spinner so a range switch reads as "loading"
+ * immediately, then queue the HTTPS fetch on the network task. */
+static void start_history_fetch(void)
+{
+  detail_window_rendered = false;
+  lv_chart_set_all_values(detail_chart, detail_series, LV_CHART_POINT_NONE);
+  detail_fill_n = 0;
+  lv_obj_add_flag(detail_marker, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(detail_error_label, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(detail_spinner, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(detail_spinner);
+  lv_obj_invalidate(detail_chart);
+  detail_history_generation =
+      history_data_request(detail_symbol, range_api[detail_range_pending]);
+  printf("[ui] history range requested: %s\r\n",
+         range_api[detail_range_pending]);
 }
 
 static void range_clicked(lv_event_t *event)
 {
-  lv_obj_t *button = lv_event_get_target_obj(event);
-  const char *range = lv_event_get_user_data(event);
-  if (selected_range_button != NULL)
+  int index = (int)(uintptr_t)lv_event_get_user_data(event);
+  if (index < 0 || index >= DETAIL_NUM_RANGES) return;
+  /* Ignore taps on the already-displayed range unless the last fetch
+   * failed (the error label is up) — then the tap retries it. */
+  if (index == detail_range_displayed &&
+      lv_obj_has_flag(detail_error_label, LV_OBJ_FLAG_HIDDEN))
   {
-    lv_obj_set_style_bg_color(selected_range_button, lv_color_hex(0x263244), 0);
+    return;
   }
-  selected_range_button = button;
-  lv_obj_set_style_bg_color(button, lv_color_hex(0xED1C24), 0);
-
-  char text[40];
-  snprintf(text, sizeof(text), "Loading %s history...", range);
-  lv_label_set_text(detail_status, text);
-  detail_history_generation = history_data_request(detail_symbol, range);
-  printf("[ui] history range requested: %s\r\n", range);
+  detail_range_pending = index;
+  apply_range_styles();
+  start_history_fetch();
 }
 
 static void display_flush(lv_display_t *display, const lv_area_t *area,
@@ -334,92 +431,371 @@ static void update_rows(void)
   update_detail();
 }
 
+/* Gradient under the curve. Drawn on LV_EVENT_DRAW_MAIN_BEGIN so the
+ * chart's own line renders on top of the fill. */
+static void chart_area_fill(lv_event_t *event)
+{
+  if (detail_fill_n < 2) return;
+  lv_obj_t *chart = lv_event_get_target_obj(event);
+  lv_layer_t *layer = lv_event_get_layer(event);
+  if (chart == NULL || layer == NULL) return;
+  lv_area_t coords;
+  lv_obj_get_coords(chart, &coords);
+  chart_util_draw_polyline_fill(layer, detail_fill_x, detail_fill_y,
+                                detail_fill_n, coords.x1, coords.y1,
+                                detail_fill_bottom, detail_line_color,
+                                LV_OPA_70);
+}
+
+static float pick_y_step(float range)
+{
+  size_t count = sizeof(y_steps) / sizeof(y_steps[0]);
+  if (range <= 0.0f) return 1.0f;
+  for (size_t i = 0; i < count; ++i)
+  {
+    if (range / y_steps[i] <= 5.0f) return y_steps[i];
+  }
+  return y_steps[count - 1U];
+}
+
+static void render_history(const history_snapshot_t *history)
+{
+  size_t n = history->point_count;
+  const float *closes = history->closes;
+  if (n < 2U) return;
+
+  lv_obj_add_flag(detail_spinner, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(detail_error_label, LV_OBJ_FLAG_HIDDEN);
+
+  float lo = closes[0], hi = closes[0];
+  for (size_t i = 1; i < n; ++i)
+  {
+    if (closes[i] < lo) lo = closes[i];
+    if (closes[i] > hi) hi = closes[i];
+  }
+  if (hi - lo < 0.01f)
+  {
+    hi = lo + 0.5f;
+    lo -= 0.5f;
+  }
+
+  /* Snap the Y range to "nice" tick values: 4-6 ticks at a clean step. */
+  float step = pick_y_step(hi - lo);
+  float lo_snap = floorf(lo / step) * step;
+  float hi_snap = ceilf(hi / step) * step;
+  if (hi_snap <= lo_snap) hi_snap = lo_snap + step;
+  int n_y_ticks = (int)lroundf((hi_snap - lo_snap) / step) + 1;
+  if (n_y_ticks < 2) n_y_ticks = 2;
+  if (n_y_ticks > DETAIL_MAX_Y_TICKS) n_y_ticks = DETAIL_MAX_Y_TICKS;
+
+  /* Pass 1: format + measure the Y labels so the gutter fits the widest. */
+  char text[40];
+  int widest = 0;
+  int label_h = 16;
+  for (int j = 0; j < DETAIL_MAX_Y_TICKS; ++j)
+  {
+    lv_obj_t *label = detail_y_labels[j];
+    if (j >= n_y_ticks)
+    {
+      lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+      continue;
+    }
+    float value = hi_snap - (float)j * step;
+    if (step >= 1.0f) snprintf(text, sizeof(text), "%d", (int)lroundf(value));
+    else format_decimal_2(text, sizeof(text), value, 0);
+    lv_label_set_text(label, text);
+    lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_update_layout(label);
+    int w = lv_obj_get_width(label);
+    if (w > widest) widest = w;
+    int h = lv_obj_get_height(label);
+    if (h > label_h) label_h = h;
+  }
+
+  int gutter = widest + 6;
+  int pad_bottom = label_h + 4;
+  int plot_w = DETAIL_CHART_W - gutter;
+  int plot_h = DETAIL_CHART_H - pad_bottom;
+  if (plot_w < 1) plot_w = 1;
+  if (plot_h < 1) plot_h = 1;
+
+  /* The chart shrinks so the gutter and X strip live outside its box. */
+  lv_obj_set_pos(detail_chart, gutter, 0);
+  lv_obj_set_size(detail_chart, plot_w, plot_h);
+  lv_chart_set_axis_range(detail_chart, LV_CHART_AXIS_PRIMARY_Y,
+                          (int32_t)(lo_snap * 100.0f),
+                          (int32_t)(hi_snap * 100.0f));
+
+  /* Pass 2: place Y labels in the gutter, digits right-aligned. */
+  for (int j = 0; j < n_y_ticks; ++j)
+  {
+    int lh = lv_obj_get_height(detail_y_labels[j]);
+    int lw = lv_obj_get_width(detail_y_labels[j]);
+    int ly = (plot_h * j) / (n_y_ticks - 1) - lh / 2;
+    if (ly < 0) ly = 0;
+    if (ly + lh > plot_h) ly = plot_h - lh;
+    int lx = (gutter - 4) - lw;
+    if (lx < 0) lx = 0;
+    lv_obj_set_pos(detail_y_labels[j], lx, ly);
+  }
+
+  /* Monotone cubic smoothing — no Catmull-Rom overshoot on noisy closes. */
+  static float smooth[DETAIL_CR_MAX_OUT];
+  int out_n = ((int)n - 1) * DETAIL_CR_FACTOR + 1;
+  if (out_n > (int)DETAIL_CR_MAX_OUT) out_n = (int)DETAIL_CR_MAX_OUT;
+  chart_util_monotone_cubic(closes, n, smooth, (size_t)out_n,
+                            DETAIL_CR_FACTOR);
+
+  float span = hi_snap - lo_snap;
+  if (span <= 0.0f) span = 1.0f;
+
+  /* Progressive 1D: the X axis spans the WHOLE trading session and the
+   * line fills only the elapsed part (Revolut-style). Other ranges fill
+   * the full width. */
+  bool progressive = strcmp(history->range, "1d") == 0;
+  static float slot_value[DETAIL_CR_MAX_OUT];
+  int total_slots, active_n;
+  uint32_t session_open = 0, session_close = 0;
+  if (progressive)
+  {
+    session_open = history->session_open;
+    session_close = history->session_close;
+    uint32_t first_ts = history->timestamps[0];
+    uint32_t last_ts = history->timestamps[n - 1U];
+    if (session_open == 0U || session_close <= session_open)
+    {
+      /* API omitted session bounds: assume a 6.5 h regular US session
+       * starting at the first data point. */
+      session_open = first_ts != 0U ? first_ts : last_ts;
+      session_close = session_open + 23400U;
+    }
+    float fraction = 1.0f;
+    if (session_close > session_open && last_ts > 0U)
+    {
+      fraction = (float)(last_ts - session_open) /
+                 (float)(session_close - session_open);
+    }
+    if (fraction < 0.02f) fraction = 0.02f;   /* always show a sliver */
+    if (fraction > 1.0f) fraction = 1.0f;
+
+    total_slots = (int)DETAIL_CR_MAX_OUT;
+    active_n = (int)lroundf(fraction * (float)(total_slots - 1)) + 1;
+    if (active_n < 2) active_n = 2;
+    if (active_n > total_slots) active_n = total_slots;
+
+    /* Resample the dense smoothed curve into the elapsed slots. */
+    for (int i = 0; i < active_n; ++i)
+    {
+      float pos = (active_n > 1)
+          ? (float)i / (float)(active_n - 1) * (float)(out_n - 1) : 0.0f;
+      int i0 = (int)pos;
+      int i1 = (i0 + 1 < out_n) ? i0 + 1 : i0;
+      float fr = pos - (float)i0;
+      slot_value[i] = smooth[i0] * (1.0f - fr) + smooth[i1] * fr;
+    }
+  }
+  else
+  {
+    total_slots = out_n;
+    active_n = out_n;
+    for (int i = 0; i < out_n; ++i) slot_value[i] = smooth[i];
+  }
+
+  lv_chart_set_point_count(detail_chart, (uint32_t)total_slots);
+  for (int i = 0; i < total_slots; ++i)
+  {
+    lv_chart_set_series_value_by_id(
+        detail_chart, detail_series, (uint32_t)i,
+        i < active_n ? (int32_t)(slot_value[i] * 100.0f)
+                     : LV_CHART_POINT_NONE);
+  }
+
+  /* Fill polygon geometry (chart-local px) for the gradient callback. */
+  detail_fill_n = active_n;
+  detail_fill_bottom = plot_h;
+  for (int i = 0; i < active_n; ++i)
+  {
+    detail_fill_x[i] = (plot_w * i) / (total_slots - 1);
+    float ynorm = 1.0f - (slot_value[i] - lo_snap) / span;
+    int y = (int)lroundf(ynorm * (float)plot_h);
+    if (y < 0) y = 0;
+    if (y > plot_h) y = plot_h;
+    detail_fill_y[i] = y;
+  }
+
+  lv_chart_refresh(detail_chart);
+
+  /* Header reflects the displayed window: last close + window % change. */
+  float first = closes[0];
+  float last = closes[n - 1U];
+  float change = first != 0.0f ? (last - first) / first * 100.0f : 0.0f;
+  bool up = change >= 0.0f;
+
+  char number[20];
+  format_decimal_2(number, sizeof(number), last, 0);
+  lv_label_set_text(detail_price, number);
+  format_decimal_2(number, sizeof(number), change, 1);
+  snprintf(text, sizeof(text), "%s %s%%",
+           up ? LV_SYMBOL_UP : LV_SYMBOL_DOWN, number);
+  lv_label_set_text(detail_change, text);
+
+  lv_color_t accent = up ? lv_color_hex(0x4ADE80) : lv_color_hex(0xF87171);
+  lv_obj_set_style_text_color(detail_change, accent, 0);
+  detail_line_color = accent;
+  lv_chart_set_series_color(detail_chart, detail_series, accent);
+
+  /* X-axis labels reflect the requested range, not the API interval.
+   * 1d -> fixed session ticks (open..close clock times) so the axis covers
+   * the whole day regardless of elapsed time; other ranges sample dates
+   * from the points, last tick anchored to the newest point. */
+  if (progressive)
+  {
+    uint32_t session_span = session_close - session_open;
+    for (int k = 0; k < DETAIL_X_TICKS; ++k)
+    {
+      uint32_t t = session_open +
+          (uint32_t)(((uint64_t)session_span * (uint32_t)k) /
+                     (uint32_t)(DETAIL_X_TICKS - 1));
+      chart_civil_t civil;
+      chart_util_epoch_to_civil(t, APP_UTC_OFFSET_MINUTES, &civil);
+      snprintf(text, sizeof(text), "%02d:%02d", civil.hour, civil.minute);
+      lv_label_set_text(detail_x_labels[k], text);
+    }
+  }
+  else
+  {
+    /* Pick the date format from the window's wall-time span: years-wide
+     * windows label years, medium ones month+year, short ones day+month. */
+    long span_days = 0;
+    if (history->timestamps[0] > 0U &&
+        history->timestamps[n - 1U] > history->timestamps[0])
+    {
+      span_days = (long)((history->timestamps[n - 1U] -
+                          history->timestamps[0]) / 86400U);
+    }
+    for (int k = 0; k < DETAIL_X_TICKS; ++k)
+    {
+      size_t index = ((n - 1U) * (size_t)k) / (size_t)(DETAIL_X_TICKS - 1);
+      uint32_t t = history->timestamps[index];
+      if (t == 0U)
+      {
+        lv_label_set_text(detail_x_labels[k], "");
+        continue;
+      }
+      chart_civil_t civil;
+      chart_util_epoch_to_civil(t, APP_UTC_OFFSET_MINUTES, &civil);
+      if (span_days > 730)
+      {
+        snprintf(text, sizeof(text), "%d", civil.year);
+      }
+      else if (span_days > 365)
+      {
+        snprintf(text, sizeof(text), "%s %02d",
+                 month_names[civil.month - 1], civil.year % 100);
+      }
+      else
+      {
+        snprintf(text, sizeof(text), "%02d %s", civil.day,
+                 month_names[civil.month - 1]);
+      }
+      lv_label_set_text(detail_x_labels[k], text);
+    }
+  }
+  /* Place the X labels under the plot, centered on their tick. */
+  for (int k = 0; k < DETAIL_X_TICKS; ++k)
+  {
+    lv_obj_t *label = detail_x_labels[k];
+    int x_px = gutter + (plot_w * k) / (DETAIL_X_TICKS - 1);
+    lv_obj_update_layout(label);
+    int lw = lv_obj_get_width(label);
+    int lh = lv_obj_get_height(label);
+    int lx = x_px - lw / 2;
+    if (lx < 0) lx = 0;
+    if (lx + lw > DETAIL_CHART_W) lx = DETAIL_CHART_W - lw;
+    int ly = plot_h + (pad_bottom - lh) / 2;
+    if (ly < plot_h) ly = plot_h;
+    lv_obj_set_pos(label, lx, ly);
+  }
+
+  /* Current-price marker dot at the line's right end. */
+  lv_obj_set_style_bg_color(detail_marker, accent, 0);
+  lv_obj_clear_flag(detail_marker, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_update_layout(detail_chart);
+  lv_point_t tip;
+  lv_chart_get_point_pos_by_id(detail_chart, detail_series,
+                               (uint32_t)(active_n - 1), &tip);
+  int dot_x = tip.x - DETAIL_MARKER_SIZE / 2;
+  int dot_y = tip.y - DETAIL_MARKER_SIZE / 2;
+  if (dot_x < 0) dot_x = 0;
+  if (dot_x > plot_w - DETAIL_MARKER_SIZE) dot_x = plot_w - DETAIL_MARKER_SIZE;
+  if (dot_y < 0) dot_y = 0;
+  if (dot_y > plot_h - DETAIL_MARKER_SIZE) dot_y = plot_h - DETAIL_MARKER_SIZE;
+  lv_obj_set_pos(detail_marker, dot_x, dot_y);
+
+  /* New data is on screen: the highlighted button now matches the chart. */
+  detail_window_rendered = true;
+  detail_range_displayed = detail_range_pending;
+  apply_range_styles();
+}
+
 static void update_detail(void)
 {
   if (detail_screen == NULL) return;
 
+  /* Live quote keeps the header price fresh; the day-change % shows only
+   * until a history window renders (then the window % owns the label). */
   stock_snapshot_t stocks[APP_MAX_SYMBOLS];
   size_t stock_count = stock_data_get_all(stocks);
-  const stock_snapshot_t *snapshot = NULL;
   for (size_t i = 0; i < stock_count; ++i)
   {
-    if (stocks[i].fresh && strcmp(stocks[i].symbol, detail_symbol) == 0)
+    if (!stocks[i].fresh || strcmp(stocks[i].symbol, detail_symbol) != 0)
     {
-      snapshot = &stocks[i];
-      break;
+      continue;
     }
-  }
-  if (snapshot == NULL)
-  {
-    return;
-  }
-
-  char price[20], change[20], text[32];
-  format_decimal_2(price, sizeof(price), snapshot->last, 0);
-  format_decimal_2(change, sizeof(change), snapshot->change_pct, 1);
-  lv_label_set_text(detail_price, price);
-  snprintf(text, sizeof(text), "%s %s%%",
-           snapshot->change_pct >= 0.0f ? LV_SYMBOL_UP : LV_SYMBOL_DOWN,
-           change);
-  lv_label_set_text(detail_change, text);
-  lv_color_t accent = snapshot->change_pct >= 0.0f
-      ? lv_color_hex(0x4ADE80) : lv_color_hex(0xF87171);
-  lv_obj_set_style_text_color(detail_change, accent, 0);
-
-  const float *closes = snapshot->closes;
-  size_t point_count = snapshot->close_count;
-  history_snapshot_t history;
-  if (history_data_get(&history) &&
-      history.generation == detail_history_generation &&
-      strcmp(history.symbol, detail_symbol) == 0)
-  {
-    if (history.error)
+    char price[20];
+    format_decimal_2(price, sizeof(price), stocks[i].last, 0);
+    lv_label_set_text(detail_price, price);
+    if (!detail_window_rendered)
     {
-      lv_label_set_text(detail_status, history.status);
-    }
-    else if (history.fresh)
-    {
-      closes = history.closes;
-      point_count = history.point_count;
-      float period_change = (closes[point_count - 1U] - closes[0]) /
-                            closes[0] * 100.0f;
-      format_decimal_2(change, sizeof(change), period_change, 1);
+      char pct[20], text[32];
+      format_decimal_2(pct, sizeof(pct), stocks[i].change_pct, 1);
       snprintf(text, sizeof(text), "%s %s%%",
-               period_change >= 0.0f ? LV_SYMBOL_UP : LV_SYMBOL_DOWN, change);
+               stocks[i].change_pct >= 0.0f ? LV_SYMBOL_UP : LV_SYMBOL_DOWN,
+               pct);
       lv_label_set_text(detail_change, text);
-      accent = period_change >= 0.0f
-          ? lv_color_hex(0x4ADE80) : lv_color_hex(0xF87171);
-      lv_obj_set_style_text_color(detail_change, accent, 0);
-      snprintf(text, sizeof(text), "%s: %u points", history.range,
-               (unsigned)history.point_count);
-      lv_label_set_text(detail_status, text);
+      lv_obj_set_style_text_color(detail_change,
+                                  stocks[i].change_pct >= 0.0f
+                                      ? lv_color_hex(0x4ADE80)
+                                      : lv_color_hex(0xF87171), 0);
     }
+    break;
   }
 
-  if (point_count < 2U)
+  history_snapshot_t history;
+  if (!history_data_get(&history)) return;
+  if (history.generation != detail_history_generation) return;
+  if (strcmp(history.symbol, detail_symbol) != 0) return;
+  if (detail_done_generation == history.generation) return;
+
+  if (history.error)
   {
-    lv_line_set_points(detail_chart, detail_points, 0);
+    detail_done_generation = history.generation;
+    lv_obj_add_flag(detail_spinner, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(detail_error_label,
+                      history.status[0] != '\0' ? history.status : "no data");
+    lv_obj_clear_flag(detail_error_label, LV_OBJ_FLAG_HIDDEN);
+    /* Revert the highlight to the still-displayed range; a retap of the
+     * failed button re-issues the fetch. */
+    detail_range_pending = detail_range_displayed;
+    apply_range_styles();
     return;
   }
+  if (!history.fresh) return;
 
-  float minimum = closes[0];
-  float maximum = closes[0];
-  for (size_t i = 1; i < point_count; ++i)
-  {
-    if (closes[i] < minimum) minimum = closes[i];
-    if (closes[i] > maximum) maximum = closes[i];
-  }
-  float span = maximum - minimum;
-  if (span < 0.001f) span = 1.0f;
-  for (size_t i = 0; i < point_count; ++i)
-  {
-    detail_points[i].x = (lv_value_precise_t)
-        ((i * (DETAIL_CHART_WIDTH - 2U)) / (point_count - 1U));
-    detail_points[i].y = (lv_value_precise_t)
-        ((maximum - closes[i]) * (DETAIL_CHART_HEIGHT - 8U) / span + 4.0f);
-  }
-  lv_line_set_points(detail_chart, detail_points, point_count);
-  lv_obj_set_style_line_color(detail_chart, accent, 0);
+  detail_done_generation = history.generation;
+  render_history(&history);
+  printf("[ui] %s %s rendered: %u points\r\n", history.symbol, history.range,
+         (unsigned)history.point_count);
 }
 
 static void create_market_screen(void)
@@ -494,38 +870,50 @@ static lv_obj_t *create_text_button(lv_obj_t *parent, const char *text,
 static void create_detail_screen(const char *symbol)
 {
   snprintf(detail_symbol, sizeof(detail_symbol), "%s", symbol);
+  detail_window_rendered = false;
+  detail_range_displayed = 0;
+  detail_range_pending = 0;
+  detail_fill_n = 0;
+  detail_line_color = lv_color_hex(0x4ADE80);
+
   detail_screen = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(detail_screen, lv_color_hex(0x0B0F17), 0);
   lv_obj_set_style_bg_opa(detail_screen, LV_OPA_COVER, 0);
-  lv_obj_set_style_pad_all(detail_screen, 8, 0);
+  lv_obj_set_style_pad_all(detail_screen, DETAIL_PAD, 0);
   /* Everything fits in 480x272 - never scroll the detail screen. */
   lv_obj_clear_flag(detail_screen, LV_OBJ_FLAG_SCROLLABLE);
 
+  /* Compact single-row header:
+   * [logo] [symbol] [price] [chg %] ...spacer... [back] */
+  lv_obj_t *header = lv_obj_create(detail_screen);
+  lv_obj_remove_style_all(header);
+  lv_obj_set_size(header, DETAIL_CONTENT_W, DETAIL_HEADER_H);
+  lv_obj_align(header, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(header, 8, 0);
+  lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
   /* Prefer the fetched logo; fall back to the bundled AMD asset, then to a
-   * brand-colored initial badge (mirrors create_badge() for the market rows). */
+   * brand-colored initial badge (mirrors create_badge() for the rows). */
   const lv_image_dsc_t *api_logo = logo_cache_lookup(symbol);
-  if (api_logo != NULL)
+  if (api_logo != NULL || strcmp(symbol, "AMD") == 0)
   {
-    lv_obj_t *logo = lv_image_create(detail_screen);
-    lv_image_set_src(logo, api_logo);
-    lv_obj_align(logo, LV_ALIGN_TOP_LEFT, 0, 0);
-  }
-  else if (strcmp(symbol, "AMD") == 0)
-  {
-    lv_obj_t *logo = lv_image_create(detail_screen);
-    lv_image_set_src(logo, &logo_AMD);
-    lv_obj_align(logo, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_t *logo = lv_image_create(header);
+    lv_image_set_src(logo, api_logo != NULL ? api_logo : &logo_AMD);
+    lv_image_set_scale(logo, 213);   /* 48px source -> 40px slot */
+    lv_obj_set_size(logo, 40, 40);
   }
   else
   {
-    lv_obj_t *badge = lv_obj_create(detail_screen);
-    lv_obj_set_size(badge, 48, 48);
+    lv_obj_t *badge = lv_obj_create(header);
+    lv_obj_set_size(badge, 40, 40);
     lv_obj_set_style_radius(badge, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(badge, brand_color(symbol), 0);
     lv_obj_set_style_border_width(badge, 0, 0);
     lv_obj_set_style_pad_all(badge, 0, 0);
     lv_obj_clear_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_align(badge, LV_ALIGN_TOP_LEFT, 0, 0);
 
     char initial[2] = { symbol[0], '\0' };
     lv_obj_t *badge_label = lv_label_create(badge);
@@ -535,72 +923,145 @@ static void create_detail_screen(const char *symbol)
     lv_obj_center(badge_label);
   }
 
-  lv_obj_t *symbol_label = lv_label_create(detail_screen);
+  lv_obj_t *symbol_label = lv_label_create(header);
   lv_label_set_text(symbol_label, symbol);
   lv_obj_set_style_text_color(symbol_label, lv_color_hex(0xE7EEF7), 0);
   lv_obj_set_style_text_font(symbol_label, &lv_font_montserrat_20, 0);
-  lv_obj_align(symbol_label, LV_ALIGN_TOP_LEFT, 58, 2);
 
-  detail_price = lv_label_create(detail_screen);
+  detail_price = lv_label_create(header);
   lv_label_set_text(detail_price, "---.--");
   lv_obj_set_style_text_color(detail_price, lv_color_hex(0xE7EEF7), 0);
   lv_obj_set_style_text_font(detail_price, &lv_font_montserrat_20, 0);
-  lv_obj_align(detail_price, LV_ALIGN_TOP_LEFT, 58, 27);
 
-  detail_change = lv_label_create(detail_screen);
+  detail_change = lv_label_create(header);
   lv_label_set_text(detail_change, "--.--%");
   lv_obj_set_style_text_color(detail_change, lv_color_hex(0x8A98AD), 0);
-  lv_obj_align(detail_change, LV_ALIGN_TOP_LEFT, 154, 31);
+  lv_obj_set_style_text_font(detail_change, &lv_font_montserrat_14, 0);
 
-  create_text_button(detail_screen, LV_SYMBOL_LEFT " Back", back_clicked, NULL);
-  lv_obj_align(lv_obj_get_child(detail_screen, -1), LV_ALIGN_TOP_RIGHT, 0, 4);
+  /* Flex-grow spacer pushes the back button to the far right. */
+  lv_obj_t *spacer = lv_obj_create(header);
+  lv_obj_remove_style_all(spacer);
+  lv_obj_set_height(spacer, 1);
+  lv_obj_set_flex_grow(spacer, 1);
 
-  detail_chart = lv_line_create(detail_screen);
-  lv_obj_set_size(detail_chart, DETAIL_CHART_WIDTH, DETAIL_CHART_HEIGHT);
-  lv_obj_align(detail_chart, LV_ALIGN_TOP_MID, 0, 58);
-  lv_obj_set_style_bg_color(detail_chart, lv_color_hex(0x121A25), 0);
-  lv_obj_set_style_bg_opa(detail_chart, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_color(detail_chart, lv_color_hex(0x263244), 0);
-  lv_obj_set_style_border_width(detail_chart, 1, 0);
-  lv_obj_set_style_line_width(detail_chart, 3, 0);
-  lv_obj_set_style_line_rounded(detail_chart, true, 0);
+  lv_obj_t *back = create_text_button(header, LV_SYMBOL_LEFT, back_clicked,
+                                      NULL);
+  lv_obj_set_size(back, 44, DETAIL_HEADER_H - 8);
+  lv_obj_set_ext_click_area(back, 8);
 
-  static const char *range_labels[] = {
-    "1D", "1W", "1M", "6M", "1Y", "5Y", "Max"
-  };
-  static const char *range_api[] = {
-    "1d", "1w", "1mo", "6mo", "1y", "5y", "max"
-  };
+  /* Range buttons above the chart; index baked into the event user_data. */
   lv_obj_t *range_row = lv_obj_create(detail_screen);
-  lv_obj_set_size(range_row, LCD_WIDTH - 16, 30);
-  lv_obj_align(range_row, LV_ALIGN_BOTTOM_MID, 0, -28);
+  lv_obj_remove_style_all(range_row);
+  lv_obj_set_size(range_row, DETAIL_CONTENT_W, DETAIL_BTN_ROW_H);
+  lv_obj_align(range_row, LV_ALIGN_TOP_LEFT, 0, DETAIL_HEADER_H + 2);
   lv_obj_set_flex_flow(range_row, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(range_row, LV_FLEX_ALIGN_SPACE_BETWEEN,
                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_bg_opa(range_row, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(range_row, 0, 0);
-  lv_obj_set_style_pad_all(range_row, 0, 0);
   lv_obj_clear_flag(range_row, LV_OBJ_FLAG_SCROLLABLE);
-  for (size_t i = 0; i < sizeof(range_labels) / sizeof(range_labels[0]); ++i)
+
+  const int button_w =
+      (DETAIL_CONTENT_W - 4 * (DETAIL_NUM_RANGES - 1)) / DETAIL_NUM_RANGES;
+  for (int i = 0; i < DETAIL_NUM_RANGES; ++i)
   {
-    lv_obj_t *button = create_text_button(range_row, range_labels[i],
-                                          range_clicked, (void *)range_api[i]);
-    if (i == 0U)
-    {
-      selected_range_button = button;
-      lv_obj_set_style_bg_color(button, lv_color_hex(0xED1C24), 0);
-    }
+    lv_obj_t *button = lv_button_create(range_row);
+    lv_obj_remove_style_all(button);
+    lv_obj_set_size(button, button_w, DETAIL_BTN_ROW_H);
+    lv_obj_set_style_radius(button, 5, 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_font(button, &lv_font_montserrat_14, 0);
+
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, range_labels[i]);
+    lv_obj_center(label);
+
+    lv_obj_add_event_cb(button, range_clicked, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)i);
+    detail_range_buttons[i] = button;
   }
 
-  detail_status = lv_label_create(detail_screen);
-  lv_label_set_text(detail_status, "Live quote sparkline");
-  lv_obj_set_style_text_color(detail_status, lv_color_hex(0x8A98AD), 0);
-  lv_obj_align(detail_status, LV_ALIGN_BOTTOM_MID, 0, -6);
+  /* Card holding the chart, its Y-label gutter and X-label strip. */
+  detail_card = lv_obj_create(detail_screen);
+  lv_obj_set_size(detail_card, DETAIL_CONTENT_W, DETAIL_CARD_H);
+  lv_obj_align(detail_card, LV_ALIGN_TOP_LEFT, 0, DETAIL_CARD_Y);
+  lv_obj_set_style_bg_color(detail_card, lv_color_hex(0x121A25), 0);
+  lv_obj_set_style_bg_opa(detail_card, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(detail_card, lv_color_hex(0x263244), 0);
+  lv_obj_set_style_border_width(detail_card, 1, 0);
+  lv_obj_set_style_radius(detail_card, 10, 0);
+  lv_obj_set_style_pad_all(detail_card, DETAIL_CARD_PAD, 0);
+  lv_obj_clear_flag(detail_card, LV_OBJ_FLAG_SCROLLABLE);
 
+  /* Chart fills the card initially; render_history() shrinks it so the
+   * Y gutter (left) and X strip (below) sit outside its bounding box. */
+  detail_chart = lv_chart_create(detail_card);
+  lv_obj_set_size(detail_chart, DETAIL_CHART_W, DETAIL_CHART_H);
+  lv_obj_set_pos(detail_chart, 0, 0);
+  lv_chart_set_type(detail_chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(detail_chart, DETAIL_CR_MAX_OUT);
+  lv_chart_set_div_line_count(detail_chart, 5, 0);
+  lv_obj_set_style_pad_all(detail_chart, 0, LV_PART_MAIN);
+  lv_obj_set_style_size(detail_chart, 0, 0, LV_PART_INDICATOR);
+  lv_obj_set_style_line_width(detail_chart, 3, LV_PART_ITEMS);
+  lv_obj_set_style_bg_opa(detail_chart, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(detail_chart, 0, 0);
+  lv_obj_set_style_line_color(detail_chart, lv_color_hex(0x263244),
+                              LV_PART_MAIN);
+  lv_obj_set_style_line_opa(detail_chart, LV_OPA_40, LV_PART_MAIN);
+  lv_obj_add_event_cb(detail_chart, chart_area_fill,
+                      LV_EVENT_DRAW_MAIN_BEGIN, NULL);
+  detail_series = lv_chart_add_series(detail_chart, detail_line_color,
+                                      LV_CHART_AXIS_PRIMARY_Y);
+
+  /* Round loading indicator, centered over the (blank) chart. */
+  detail_spinner = lv_spinner_create(detail_card);
+  lv_obj_set_size(detail_spinner, 48, 48);
+  lv_obj_center(detail_spinner);
+  lv_obj_set_style_arc_width(detail_spinner, 5, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(detail_spinner, 5, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(detail_spinner, lv_color_hex(0x263244),
+                             LV_PART_MAIN);
+  lv_obj_set_style_arc_color(detail_spinner, lv_color_hex(0xED1C24),
+                             LV_PART_INDICATOR);
+
+  detail_error_label = lv_label_create(detail_card);
+  lv_label_set_text(detail_error_label, "no data");
+  lv_obj_set_style_text_color(detail_error_label, lv_color_hex(0xF87171), 0);
+  lv_obj_set_style_text_font(detail_error_label, &lv_font_montserrat_16, 0);
+  lv_obj_center(detail_error_label);
+  lv_obj_add_flag(detail_error_label, LV_OBJ_FLAG_HIDDEN);
+
+  /* Tick label pools; render_history() formats, shows and places them. */
+  for (int j = 0; j < DETAIL_MAX_Y_TICKS; ++j)
+  {
+    lv_obj_t *label = lv_label_create(detail_card);
+    lv_label_set_text(label, "");
+    lv_obj_set_style_text_color(label, lv_color_hex(0x8A98AD), 0);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+    detail_y_labels[j] = label;
+  }
+  for (int k = 0; k < DETAIL_X_TICKS; ++k)
+  {
+    lv_obj_t *label = lv_label_create(detail_card);
+    lv_label_set_text(label, "");
+    lv_obj_set_style_text_color(label, lv_color_hex(0x8A98AD), 0);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    detail_x_labels[k] = label;
+  }
+
+  /* Current-price marker; chart child so chart-local coords apply. */
+  detail_marker = lv_obj_create(detail_chart);
+  lv_obj_remove_style_all(detail_marker);
+  lv_obj_set_size(detail_marker, DETAIL_MARKER_SIZE, DETAIL_MARKER_SIZE);
+  lv_obj_set_style_radius(detail_marker, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(detail_marker, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(detail_marker, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(detail_marker, LV_OBJ_FLAG_HIDDEN);
+
+  apply_range_styles();
   update_detail();
   lv_screen_load(detail_screen);
-  detail_history_generation = history_data_request(detail_symbol, "1d");
-  lv_label_set_text(detail_status, "Loading 1d history...");
+  start_history_fetch();
 }
 
 void StartUiTask(void const *argument)

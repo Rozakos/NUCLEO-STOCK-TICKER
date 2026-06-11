@@ -84,6 +84,12 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
       admin up to APP_MAX_SYMBOLS=8). Tapping any row opens a detail screen (AMD shows its logo;
       others show a brand-colored initial badge) with a full-width chart and range buttons that
       asynchronously fetch real `/history/{symbol}?range=...` data via the serialized TLS task.
+      Detail screen is now a full CYD `detail_screen.cpp` port: `lv_chart` + grid, spinner
+      while loading, gradient area fill under the curve, snapped price ticks on Y, date/time
+      ticks on X, monotone-cubic smoothing, last-point marker dot, instant range-button
+      highlight (pending vs displayed split), and a progressive 1D session chart
+      (`session_open`/`session_close` parsed from the API). Flashed 2026-06-11; awaiting
+      visual confirmation.
 - [~] **Web admin**: runtime symbol add/delete and refresh interval work at
       `http://<board-ip>/`. Settings load/save atomically through `ticker.cfg` on SD when a
       formatted card is available; target currently reports SD unavailable.
@@ -109,19 +115,24 @@ implements the STM32F746G-DISCO RMII MSP setup inside USER CODE 3 and calls
 instead of treating every failure as link-down.
 
 **DO THIS NEXT:**
-1. Tap the AMD row and each range button. Confirm the chart and period percentage change after
-   the `Loading <range> history...` state. Expected UART:
+1. Visually verify the new CYD-style detail screen (flashed 2026-06-11, not yet confirmed):
+   tap a row → spinner over a blank chart card → smoothed gradient chart with Y price ticks
+   and X date/time ticks. 1D must span the whole session (line stops at "now", marker dot at
+   the end); other ranges fill the width with date labels. Tap each range button: highlight
+   moves instantly, spinner shows, chart + window % catch up. On fetch failure a red error
+   label appears and the highlight reverts. Expected UART:
    ```
-   [touch] press x=<x> y=<y>
    [ui] row clicked: AMD
    [ui] history range requested: 1mo
    [history] fetching AMD 1mo...
    [history] AMD 1mo: <n> points
+   [ui] AMD 1mo rendered: <n> points
    ```
 2. Web admin is verified at `http://192.168.1.154/` on the current DHCP lease. The current
    address is always printed at boot as `[web] admin ready: http://<ip>/`.
-3. Next UI work: add chart axis/date labels and use `session_open`/`session_close` for a
-   progressive intraday chart.
+3. Possible next UI work: gradient/area-fill sparklines on the market list rows (CYD parity),
+   chart X-label times use fixed `APP_UTC_OFFSET_MINUTES` (config.h, currently EEST +180) —
+   could become a web-admin setting; flash is at 970 KB of 1 MB (watch `-O0` Debug growth).
 
 ### (done) Enabling LwIP in CubeMX — kept for reference
 Open `NUCLEO-STOCK-TICKER.ioc`:
@@ -152,6 +163,23 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 - Many Disco peripherals are enabled but unused (DCMI/SAI/SPDIF/QSPI/USB host) — ignore them.
 
 ## 8. Session log
+
+- **2026-06-11 — Claude (Fable 5, Claude Code):** Ported the CYD detail screen properly
+  (user: screen "doesn't update nicely, no round progress bar, no gradients, no axis labels").
+  Fetched `src/ui/detail_screen.cpp` + `src/util/{area_fill,interpolate}.cpp` from the CYD repo
+  and ported to C/LVGL 9.5: new `app/chart_util.{c,h}` (Fritsch-Carlson monotone cubic
+  smoothing, row-rasterized gradient polyline fill, epoch→civil date conversion); detail
+  screen rebuilt around `lv_chart` (was `lv_line`) with grid lines, `lv_spinner` during
+  fetches, alpha-gradient area fill via `LV_EVENT_DRAW_MAIN_BEGIN`, snapped Y price ticks in
+  a measured gutter, 4 X date/time ticks (format auto-picks HH:MM / DD Mon / Mon YY / YYYY by
+  window span), last-point marker dot, pending-vs-displayed range state (instant tap
+  highlight, error revert + retry), and the progressive 1D session chart — `stock_api.c` now
+  parses `session_open`/`session_close` (fields confirmed in the live API and CYD's
+  `quote_fetcher.cpp`). Added `APP_UTC_OFFSET_MINUTES` (config.h, +180 EEST) for axis times.
+  Spinner/arc/chart widgets were already compiled in (lv_conf defaults). Built via bundled
+  make + GNU tools (headless CubeIDE blocked: IDE workspace open; hand-added chart_util to
+  git-ignored `Debug/.../subdir.mk` + `objects.list` — IDE regenerates these), zero warnings,
+  text 970 KB. Flashed + MCU reset OK. **Awaiting on-screen visual confirmation (§6).**
 
 - **2026-06-09 - Codex (GPT-5):** Restored fetched PNG logo decoding by fixing the actual
   external-LVGL-heap root cause. Cortex-M7's default map treated `0xC0000000` SDRAM as Device
