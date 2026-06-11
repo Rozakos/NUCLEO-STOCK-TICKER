@@ -1624,8 +1624,12 @@ void StartDefaultTask(void const * argument)
   /* USER CODE BEGIN 5 */
   printf("\r\n[boot] NUCLEO-STOCK-TICKER: LwIP up, starting app tasks\r\n");
 
-  /* Start the UI before network logging can contend for the UART console. */
-  osThreadDef(uiTask, StartUiTask, osPriorityAboveNormal, 0, 2048);
+  /* Start the UI before network logging can contend for the UART console.
+   * Priority must NOT exceed the LwIP tcpip_thread/netTask (both Normal):
+   * continuous LVGL rendering (e.g. the detail-screen loading spinner) at
+   * AboveNormal starved the TCP stack, the board stopped ACKing mid-TLS
+   * handshake and the server reset the connection (-0x004E SEND_FAILED). */
+  osThreadDef(uiTask, StartUiTask, osPriorityNormal, 0, 2048);
   osThreadId ui_task = osThreadCreate(osThread(uiTask), NULL);
 
   /* 2048 words: handle_client (request[1536]) nests append_symbols_page

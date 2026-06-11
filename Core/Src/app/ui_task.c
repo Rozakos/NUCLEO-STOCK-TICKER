@@ -219,6 +219,9 @@ static void display_flush(lv_display_t *display, const lv_area_t *area,
       {
         break;
       }
+      /* Yield while waiting for vblank: a busy spin here once ate the
+       * timeslices the TCP stack needed during animations. */
+      osDelay(1);
     }
     HAL_LTDC_SetAddress(&hltdc, (uint32_t)pixels, 0U);
   }

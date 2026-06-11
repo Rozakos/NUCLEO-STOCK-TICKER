@@ -13,11 +13,16 @@
 
 enum { SLOT_EMPTY = 0, SLOT_READY, SLOT_FAILED };
 
+/* A transient TLS/HTTP failure shouldn't blank the logo until reboot:
+ * retry a failed fetch on later refresh cycles, up to this many attempts. */
+#define LOGO_MAX_ATTEMPTS 3U
+
 typedef struct
 {
   char symbol[APP_SYMBOL_LENGTH];
   uint8_t *png;            /* -> SDRAM slot (assigned on first use) */
   volatile uint8_t state;
+  uint8_t attempts;
   lv_image_dsc_t dsc;
 } logo_slot_t;
 
@@ -76,7 +81,10 @@ bool logo_cache_should_fetch(const char *symbol)
 {
   taskENTER_CRITICAL();
   logo_slot_t *slot = find_or_assign(symbol);
-  bool fetch = (slot != NULL && slot->state == SLOT_EMPTY);
+  bool fetch = (slot != NULL &&
+                (slot->state == SLOT_EMPTY ||
+                 (slot->state == SLOT_FAILED &&
+                  slot->attempts < LOGO_MAX_ATTEMPTS)));
   taskEXIT_CRITICAL();
   return fetch;
 }
@@ -120,6 +128,10 @@ void logo_cache_mark_failed(const char *symbol)
   if (slot != NULL)
   {
     slot->state = SLOT_FAILED;
+    if (slot->attempts < LOGO_MAX_ATTEMPTS)
+    {
+      slot->attempts++;
+    }
   }
   taskEXIT_CRITICAL();
 }

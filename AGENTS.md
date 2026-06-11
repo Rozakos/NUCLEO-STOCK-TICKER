@@ -164,6 +164,18 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-11 — Claude (Fable 5, Claude Code):** Fixed TLS failures during history requests
+  (`-0x004E` = `MBEDTLS_ERR_NET_SEND_FAILED`). Root cause: `uiTask` ran at AboveNormal — above
+  the LwIP `tcpip_thread` and `netTask` (both Normal) — and the new detail-screen spinner keeps
+  LVGL rendering continuously while `display_flush` busy-waited up to 20 ms per frame for
+  vsync. The starved TCP stack stopped ACKing mid-handshake and Cloudflare reset the
+  connection. Fix: `uiTask` → Normal (FreeRTOS time-slicing shares fairly) and the vsync wait
+  now yields (`osDelay(1)` in the poll loop). Also made failed logo fetches retry (up to 3
+  attempts; previously one transient failure blanked the logo until reboot). **Verified live
+  on COM4**: history 1d/1w/1y fetched and rendered while the spinner animated and quote/logo
+  fetches ran concurrently; rapid 1mo→1y taps correctly superseded the stale request; zero
+  TLS errors. UI remains smooth at Normal priority.
+
 - **2026-06-11 — Claude (Fable 5, Claude Code):** Ported the CYD detail screen properly
   (user: screen "doesn't update nicely, no round progress bar, no gradients, no axis labels").
   Fetched `src/ui/detail_screen.cpp` + `src/util/{area_fill,interpolate}.cpp` from the CYD repo
