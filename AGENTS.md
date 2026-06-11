@@ -164,6 +164,22 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-11 — Claude (Fable 5, Claude Code):** Three UX features (flashed, pending visual
+  confirm): (1) **Adaptive market list** — >4 symbols switches the list to two side-by-side
+  columns of compact rows (`LV_FLEX_FLOW_COLUMN_WRAP`, 4 per column, no sparkline, smaller
+  fonts/badges) so up to 8 symbols never scroll; ≤4 keeps full-width rows. (2) **Shares
+  owned** — new `settings_get/set_shares*` (index-aligned with symbols, persisted as a
+  `shares=` CSV line in `ticker.cfg`), web UI per-symbol qty input (`POST /shares`; NOTE:
+  `form_value()` truncates at '&', so extract the LAST form field first), holdings value on
+  the web Live Markets cards, "12.50 sh = $5916.25" in the detail header (tracks live quote),
+  and portfolio total in the status bar ("$12345 | 42s"). (3) **Network info popup** — tapping
+  the status-bar wifi icon opens a modal (top layer, tap-anywhere closes) with link state,
+  IP/GW/mask/DNS (`_r` ntoa variants — plain `ip4addr_ntoa` shares one static buffer), MAC,
+  web-admin URL, uptime; icon turns red on link/lease loss. Capacity question answered: SDRAM
+  is nowhere near a limit (~4.9 MB free; logos ≈25 KB/symbol incl. decode); going to 16
+  symbols needs UI task stack bump (by-value `stocks[APP_MAX_SYMBOLS]` copies), a grid/paged
+  list layout, and slower refresh or a batch quote endpoint (TLS handshake ≈1-3 s each).
+
 - **2026-06-11 — Claude (Fable 5, Claude Code):** Fixed TLS failures during history requests
   (`-0x004E` = `MBEDTLS_ERR_NET_SEND_FAILED`). Root cause: `uiTask` ran at AboveNormal — above
   the LwIP `tcpip_thread` and `netTask` (both Normal) — and the new detail-screen spinner keeps

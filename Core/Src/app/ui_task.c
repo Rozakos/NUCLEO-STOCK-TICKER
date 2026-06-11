@@ -15,6 +15,7 @@
 
 #include "cmsis_os.h"
 #include "lvgl.h"
+#include "lwip/dns.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/netif.h"
 #include "main.h"
@@ -29,6 +30,9 @@
 #define STATUS_HEIGHT 28
 #define ROW_HEIGHT 54
 #define ROW_GAP 5
+/* >4 symbols: two side-by-side columns of compact rows (4 per column fills
+ * the 244 px list height), so up to APP_MAX_SYMBOLS=8 never scrolls. */
+#define ROW_COMPACT_WIDTH ((LCD_WIDTH - 24) / 2)
 #define SPARK_WIDTH 150
 #define SPARK_HEIGHT 34
 
@@ -70,15 +74,18 @@ typedef struct
 
 static market_row_t rows[APP_MAX_SYMBOLS];
 static size_t row_count;
+static bool list_compact;   /* true when the list shows two columns */
 static uint32_t settings_seen;
 static lv_obj_t *list;
 static lv_obj_t *link_label;
 static lv_obj_t *updated_label;
+static lv_obj_t *net_info_panel;   /* modal connection-info popup */
 static lv_obj_t *market_screen;
 static lv_obj_t *detail_screen;
 static lv_obj_t *detail_card;
 static lv_obj_t *detail_price;
 static lv_obj_t *detail_change;
+static lv_obj_t *detail_holdings;
 static lv_obj_t *detail_chart;
 static lv_chart_series_t *detail_series;
 static lv_obj_t *detail_spinner;
@@ -137,6 +144,7 @@ static void back_clicked(lv_event_t *event)
   lv_obj_delete_async(detail_screen);
   detail_screen = NULL;
   detail_card = NULL;
+  detail_holdings = NULL;
   detail_chart = NULL;
   detail_series = NULL;
   detail_spinner = NULL;
@@ -248,33 +256,26 @@ static lv_color_t brand_color(const char *symbol)
   return lv_color_hex(palette[hash % (sizeof(palette) / sizeof(palette[0]))]);
 }
 
-static void create_badge(market_row_t *market)
+static void create_badge(market_row_t *market, bool compact)
 {
-  const lv_image_dsc_t *api_logo = logo_cache_lookup(market->symbol);
-  if (api_logo != NULL)
-  {
-    market->badge = lv_image_create(market->row);
-    lv_image_set_src(market->badge, api_logo);
-    lv_image_set_scale(market->badge, 203);   /* 48px PNG -> 38px badge */
-    lv_obj_set_size(market->badge, 38, 38);
-    lv_obj_clear_flag(market->badge, LV_OBJ_FLAG_CLICKABLE);
-    market->logo_applied = true;
-    return;
-  }
+  const int size = compact ? 32 : 38;
+  const int scale = (size * 256) / 48;   /* logos are 48px sources */
 
-  if (strcmp(market->symbol, "AMD") == 0)
+  const lv_image_dsc_t *api_logo = logo_cache_lookup(market->symbol);
+  if (api_logo != NULL || strcmp(market->symbol, "AMD") == 0)
   {
     market->badge = lv_image_create(market->row);
-    lv_image_set_src(market->badge, &logo_AMD);
-    lv_image_set_scale(market->badge, 203);
-    lv_obj_set_size(market->badge, 38, 38);
+    lv_image_set_src(market->badge,
+                     api_logo != NULL ? api_logo : &logo_AMD);
+    lv_image_set_scale(market->badge, scale);
+    lv_obj_set_size(market->badge, size, size);
     lv_obj_clear_flag(market->badge, LV_OBJ_FLAG_CLICKABLE);
     market->logo_applied = true;
     return;
   }
 
   market->badge = lv_obj_create(market->row);
-  lv_obj_set_size(market->badge, 38, 38);
+  lv_obj_set_size(market->badge, size, size);
   lv_obj_set_style_radius(market->badge, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_bg_color(market->badge, brand_color(market->symbol), 0);
   lv_obj_set_style_border_width(market->badge, 0, 0);
@@ -285,46 +286,57 @@ static void create_badge(market_row_t *market)
   lv_obj_t *label = lv_label_create(market->badge);
   lv_label_set_text(label, initial);
   lv_obj_set_style_text_color(label, lv_color_hex(0x0B0F17), 0);
-  lv_obj_set_style_text_font(label, &lv_font_montserrat_18, 0);
+  lv_obj_set_style_text_font(label, compact ? &lv_font_montserrat_14
+                                            : &lv_font_montserrat_18, 0);
   lv_obj_center(label);
 }
 
-static void create_market_row(const char *symbol, market_row_t *market)
+static void create_market_row(const char *symbol, market_row_t *market,
+                              bool compact)
 {
   memset(market, 0, sizeof(*market));
   snprintf(market->symbol, sizeof(market->symbol), "%s", symbol);
 
   market->row = lv_obj_create(list);
-  lv_obj_set_size(market->row, LCD_WIDTH - 12, ROW_HEIGHT);
+  lv_obj_set_size(market->row, compact ? ROW_COMPACT_WIDTH : LCD_WIDTH - 12,
+                  ROW_HEIGHT);
   lv_obj_set_style_bg_color(market->row, lv_color_hex(0x16202D), 0);
   lv_obj_set_style_bg_color(market->row, lv_color_hex(0x223349),
                             LV_STATE_PRESSED);
   lv_obj_set_style_border_width(market->row, 0, 0);
   lv_obj_set_style_radius(market->row, 8, 0);
-  lv_obj_set_style_pad_hor(market->row, 8, 0);
+  lv_obj_set_style_pad_hor(market->row, compact ? 7 : 8, 0);
   lv_obj_set_style_pad_ver(market->row, 7, 0);
   lv_obj_clear_flag(market->row, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(market->row, row_clicked, LV_EVENT_CLICKED, market);
 
-  create_badge(market);
+  create_badge(market, compact);
 
   market->symbol_label = lv_label_create(market->row);
   lv_label_set_text(market->symbol_label, symbol);
   lv_obj_set_style_text_color(market->symbol_label, lv_color_hex(0xE7EEF7), 0);
-  lv_obj_set_style_text_font(market->symbol_label, &lv_font_montserrat_18, 0);
-  lv_obj_align(market->symbol_label, LV_ALIGN_LEFT_MID, 48, 0);
+  lv_obj_set_style_text_font(market->symbol_label,
+                             compact ? &lv_font_montserrat_14
+                                     : &lv_font_montserrat_18, 0);
+  lv_obj_align(market->symbol_label, LV_ALIGN_LEFT_MID, compact ? 38 : 48, 0);
 
-  market->spark = lv_line_create(market->row);
-  lv_obj_set_size(market->spark, SPARK_WIDTH, SPARK_HEIGHT);
-  lv_obj_align(market->spark, LV_ALIGN_CENTER, 22, 0);
-  lv_obj_set_style_line_width(market->spark, 2, 0);
-  lv_obj_set_style_line_rounded(market->spark, true, 0);
-  lv_obj_set_style_line_color(market->spark, lv_color_hex(0x8A98AD), 0);
+  if (!compact)
+  {
+    /* Sparkline only fits the full-width rows; update_spark() skips NULL. */
+    market->spark = lv_line_create(market->row);
+    lv_obj_set_size(market->spark, SPARK_WIDTH, SPARK_HEIGHT);
+    lv_obj_align(market->spark, LV_ALIGN_CENTER, 22, 0);
+    lv_obj_set_style_line_width(market->spark, 2, 0);
+    lv_obj_set_style_line_rounded(market->spark, true, 0);
+    lv_obj_set_style_line_color(market->spark, lv_color_hex(0x8A98AD), 0);
+  }
 
   market->price = lv_label_create(market->row);
   lv_label_set_text(market->price, "---.--");
   lv_obj_set_style_text_color(market->price, lv_color_hex(0xE7EEF7), 0);
-  lv_obj_set_style_text_font(market->price, &lv_font_montserrat_18, 0);
+  lv_obj_set_style_text_font(market->price,
+                             compact ? &lv_font_montserrat_16
+                                     : &lv_font_montserrat_18, 0);
   lv_obj_align(market->price, LV_ALIGN_TOP_RIGHT, 0, 0);
 
   market->change = lv_label_create(market->row);
@@ -338,12 +350,21 @@ static void rebuild_rows(void)
 {
   char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
   size_t count = settings_get_symbols(symbols);
+  bool compact = count > 4U;
+  list_compact = compact;
 
   lv_obj_clean(list);
+  /* <=4 symbols: one full-width column. 5-8: column-major wrap -> two
+   * side-by-side columns (first four left, rest right), nothing scrolls. */
+  lv_obj_set_flex_flow(list, compact ? LV_FLEX_FLOW_COLUMN_WRAP
+                                     : LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        compact ? LV_FLEX_ALIGN_SPACE_EVENLY
+                                : LV_FLEX_ALIGN_CENTER);
   row_count = count;
   for (size_t i = 0; i < row_count; ++i)
   {
-    create_market_row(symbols[i], &rows[i]);
+    create_market_row(symbols[i], &rows[i], compact);
   }
   settings_seen = settings_generation();
 }
@@ -351,6 +372,7 @@ static void rebuild_rows(void)
 static void update_spark(market_row_t *market, const stock_snapshot_t *snapshot,
                          lv_color_t color)
 {
+  if (market->spark == NULL) return;   /* compact rows have no sparkline */
   if (snapshot->close_count < 2U)
   {
     lv_line_set_points(market->spark, market->points, 0);
@@ -382,6 +404,10 @@ static void update_rows(void)
 {
   stock_snapshot_t stocks[APP_MAX_SYMBOLS];
   size_t stock_count = stock_data_get_all(stocks);
+  float shares[APP_MAX_SYMBOLS];
+  settings_get_shares(shares);
+  float portfolio_total = 0.0f;
+  bool portfolio_any = false;
 
   for (size_t row = 0; row < row_count; ++row)
   {
@@ -391,11 +417,12 @@ static void update_rows(void)
       const lv_image_dsc_t *api_logo = logo_cache_lookup(rows[row].symbol);
       if (api_logo != NULL)
       {
+        const int size = list_compact ? 32 : 38;
         lv_obj_delete(rows[row].badge);
         rows[row].badge = lv_image_create(rows[row].row);
         lv_image_set_src(rows[row].badge, api_logo);
-        lv_image_set_scale(rows[row].badge, 203);
-        lv_obj_set_size(rows[row].badge, 38, 38);
+        lv_image_set_scale(rows[row].badge, (size * 256) / 48);
+        lv_obj_set_size(rows[row].badge, size, size);
         lv_obj_clear_flag(rows[row].badge, LV_OBJ_FLAG_CLICKABLE);
         rows[row].logo_applied = true;
         printf("[ui] logo applied: %s\r\n", rows[row].symbol);
@@ -413,6 +440,12 @@ static void update_rows(void)
     }
     if (snapshot == NULL || !snapshot->fresh) continue;
 
+    if (shares[row] > 0.0f)
+    {
+      portfolio_total += shares[row] * snapshot->last;
+      portfolio_any = true;
+    }
+
     char price[20], change[20], text[32];
     format_decimal_2(price, sizeof(price), snapshot->last, 0);
     format_decimal_2(change, sizeof(change), snapshot->change_pct, 1);
@@ -427,9 +460,25 @@ static void update_rows(void)
     update_spark(&rows[row], snapshot, accent);
   }
 
-  char updated[32];
-  snprintf(updated, sizeof(updated), "updated %lus",
-           (unsigned long)(HAL_GetTick() / 1000U));
+  /* Status icon goes red when the link drops or the lease is lost. */
+  bool online = netif_is_link_up(&gnetif) &&
+                !ip4_addr_isany_val(*netif_ip4_addr(&gnetif));
+  lv_obj_set_style_text_color(link_label, online ? lv_color_hex(0x4ADE80)
+                                                 : lv_color_hex(0xF87171), 0);
+
+  char updated[40];
+  if (portfolio_any)
+  {
+    /* Whole dollars keep the status bar narrow even for large totals. */
+    snprintf(updated, sizeof(updated), "$%lu | %lus",
+             (unsigned long)(portfolio_total + 0.5f),
+             (unsigned long)(HAL_GetTick() / 1000U));
+  }
+  else
+  {
+    snprintf(updated, sizeof(updated), "updated %lus",
+             (unsigned long)(HAL_GetTick() / 1000U));
+  }
   lv_label_set_text(updated_label, updated);
   update_detail();
 }
@@ -758,6 +807,36 @@ static void update_detail(void)
     char price[20];
     format_decimal_2(price, sizeof(price), stocks[i].last, 0);
     lv_label_set_text(detail_price, price);
+
+    /* Holdings line tracks the live quote. */
+    char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
+    float shares[APP_MAX_SYMBOLS];
+    size_t symbol_count = settings_get_symbols(symbols);
+    settings_get_shares(shares);
+    float quantity = 0.0f;
+    for (size_t s = 0; s < symbol_count; ++s)
+    {
+      if (strcmp(symbols[s], detail_symbol) == 0)
+      {
+        quantity = shares[s];
+        break;
+      }
+    }
+    if (quantity > 0.0f)
+    {
+      char quantity_text[20], value_text[20], holdings[48];
+      format_decimal_2(quantity_text, sizeof(quantity_text), quantity, 0);
+      format_decimal_2(value_text, sizeof(value_text),
+                       quantity * stocks[i].last, 0);
+      snprintf(holdings, sizeof(holdings), "%s sh = $%s", quantity_text,
+               value_text);
+      lv_label_set_text(detail_holdings, holdings);
+    }
+    else
+    {
+      lv_label_set_text(detail_holdings, "");
+    }
+
     if (!detail_window_rendered)
     {
       char pct[20], text[32];
@@ -801,6 +880,92 @@ static void update_detail(void)
          (unsigned)history.point_count);
 }
 
+static void net_info_close(lv_event_t *event)
+{
+  (void)event;
+  if (net_info_panel != NULL)
+  {
+    lv_obj_delete_async(net_info_panel);
+    net_info_panel = NULL;
+  }
+}
+
+/* Tap on the status-bar link icon: modal popup with connection details.
+ * Lives on the top layer so it floats above whichever screen is active;
+ * tapping anywhere dismisses it. */
+static void link_clicked(lv_event_t *event)
+{
+  (void)event;
+  if (net_info_panel != NULL) return;
+
+  net_info_panel = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(net_info_panel, LCD_WIDTH, LCD_HEIGHT);
+  lv_obj_set_pos(net_info_panel, 0, 0);
+  lv_obj_set_style_bg_color(net_info_panel, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(net_info_panel, LV_OPA_60, 0);
+  lv_obj_set_style_border_width(net_info_panel, 0, 0);
+  lv_obj_set_style_radius(net_info_panel, 0, 0);
+  lv_obj_clear_flag(net_info_panel, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(net_info_panel, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(net_info_panel, net_info_close, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *card = lv_obj_create(net_info_panel);
+  lv_obj_set_size(card, 320, 216);
+  lv_obj_center(card);
+  lv_obj_set_style_bg_color(card, lv_color_hex(0x121A25), 0);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x263244), 0);
+  lv_obj_set_style_border_width(card, 1, 0);
+  lv_obj_set_style_radius(card, 10, 0);
+  lv_obj_set_style_pad_all(card, 14, 0);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_EVENT_BUBBLE);   /* tap closes too */
+
+  bool link_up = netif_is_link_up(&gnetif);
+  bool bound = !ip4_addr_isany_val(*netif_ip4_addr(&gnetif));
+
+  lv_obj_t *title = lv_label_create(card);
+  lv_label_set_text(title, LV_SYMBOL_WIFI "  ETHERNET");
+  lv_obj_set_style_text_color(title, link_up && bound
+      ? lv_color_hex(0x4ADE80) : lv_color_hex(0xF87171), 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  /* ip4addr_ntoa() reuses one static buffer - use the _r variants. */
+  char ip[16], gateway[16], netmask[16], dns[16] = "-";
+  ip4addr_ntoa_r(netif_ip4_addr(&gnetif), ip, sizeof(ip));
+  ip4addr_ntoa_r(netif_ip4_gw(&gnetif), gateway, sizeof(gateway));
+  ip4addr_ntoa_r(netif_ip4_netmask(&gnetif), netmask, sizeof(netmask));
+  const ip_addr_t *dns_server = dns_getserver(0);
+  if (dns_server != NULL && !ip_addr_isany(dns_server))
+  {
+    ipaddr_ntoa_r(dns_server, dns, sizeof(dns));
+  }
+
+  char text[300];
+  snprintf(text, sizeof(text),
+           "Link        %s\n"
+           "IP          %s\n"
+           "Gateway     %s\n"
+           "Netmask     %s\n"
+           "DNS         %s\n"
+           "MAC         %02X:%02X:%02X:%02X:%02X:%02X\n"
+           "Web admin   http://%s/\n"
+           "Uptime      %lus",
+           link_up ? (bound ? "up (DHCP bound)" : "up (no lease)") : "DOWN",
+           bound ? ip : "-", gateway, netmask, dns,
+           gnetif.hwaddr[0], gnetif.hwaddr[1], gnetif.hwaddr[2],
+           gnetif.hwaddr[3], gnetif.hwaddr[4], gnetif.hwaddr[5],
+           bound ? ip : "-",
+           (unsigned long)(HAL_GetTick() / 1000U));
+
+  lv_obj_t *info = lv_label_create(card);
+  lv_label_set_text(info, text);
+  lv_obj_set_style_text_color(info, lv_color_hex(0xE7EEF7), 0);
+  lv_obj_set_style_text_font(info, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_line_space(info, 4, 0);
+  lv_obj_align(info, LV_ALIGN_TOP_LEFT, 0, 28);
+}
+
 static void create_market_screen(void)
 {
   lv_obj_t *screen = lv_screen_active();
@@ -822,6 +987,10 @@ static void create_market_screen(void)
   lv_label_set_text(link_label, LV_SYMBOL_WIFI " Ethernet");
   lv_obj_set_style_text_color(link_label, lv_color_hex(0x4ADE80), 0);
   lv_obj_align(link_label, LV_ALIGN_LEFT_MID, 0, 0);
+  /* Tap the icon for the connection-info popup. */
+  lv_obj_add_flag(link_label, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_ext_click_area(link_label, 10);
+  lv_obj_add_event_cb(link_label, link_clicked, LV_EVENT_CLICKED, NULL);
 
   lv_obj_t *title = lv_label_create(bar);
   lv_label_set_text(title, "MARKETS");
@@ -940,6 +1109,12 @@ static void create_detail_screen(const char *symbol)
   lv_label_set_text(detail_change, "--.--%");
   lv_obj_set_style_text_color(detail_change, lv_color_hex(0x8A98AD), 0);
   lv_obj_set_style_text_font(detail_change, &lv_font_montserrat_14, 0);
+
+  /* Owned position ("12.50 sh = $5916.25"); empty when no shares are set. */
+  detail_holdings = lv_label_create(header);
+  lv_label_set_text(detail_holdings, "");
+  lv_obj_set_style_text_color(detail_holdings, lv_color_hex(0x8A98AD), 0);
+  lv_obj_set_style_text_font(detail_holdings, &lv_font_montserrat_14, 0);
 
   /* Flex-grow spacer pushes the back button to the far right. */
   lv_obj_t *spacer = lv_obj_create(header);

@@ -1,5 +1,6 @@
 #include "app/settings.h"
 #include "app/config.h"
+#include "app/format.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -11,6 +12,7 @@
 #include "task.h"
 
 static char current_symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
+static float current_shares[APP_MAX_SYMBOLS];  /* owned qty, index-aligned */
 static size_t current_count;
 static uint32_t generation;
 static uint32_t refresh_seconds;
@@ -28,12 +30,24 @@ static void settings_save(void)
   snprintf(path, sizeof(path), "%sticker.cfg", SDPath);
   snprintf(temp_path, sizeof(temp_path), "%sticker.tmp", SDPath);
 
+  float shares[APP_MAX_SYMBOLS];
+  settings_get_shares(shares);
+
   FIL file;
   if (f_open(&file, temp_path, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) return;
   f_printf(&file, "refresh=%lu\nsymbols=", (unsigned long)refresh);
   for (size_t i = 0; i < count; ++i)
   {
     f_printf(&file, "%s%s", i == 0U ? "" : ",", symbols[i]);
+  }
+  /* shares= must follow symbols= so the loader applies it to the right
+   * indices (newlib-nano has no %f; format_decimal_2 renders the values). */
+  f_printf(&file, "\nshares=");
+  for (size_t i = 0; i < count; ++i)
+  {
+    char quantity[20];
+    format_decimal_2(quantity, sizeof(quantity), shares[i], 0);
+    f_printf(&file, "%s%s", i == 0U ? "" : ",", quantity);
   }
   f_printf(&file, "\n");
   FRESULT result = f_sync(&file);
@@ -90,6 +104,10 @@ void settings_storage_load(void)
       if (strncmp(line, "symbols=", 8) == 0)
       {
         settings_set_symbols_csv(line + 8);
+      }
+      else if (strncmp(line, "shares=", 7) == 0)
+      {
+        settings_set_shares_csv(line + 7);
       }
       else if (strncmp(line, "refresh=", 8) == 0)
       {
@@ -150,6 +168,9 @@ bool settings_set_symbols_csv(const char *csv)
 
   taskENTER_CRITICAL();
   memcpy(current_symbols, parsed, sizeof(current_symbols));
+  /* Full list replace invalidates the index-aligned share counts; the SD
+   * loader restores them from the shares= line that follows symbols=. */
+  memset(current_shares, 0, sizeof(current_shares));
   current_count = count;
   ++generation;
   taskEXIT_CRITICAL();
@@ -187,6 +208,7 @@ bool settings_add_symbol(const char *symbol)
     }
     if (!duplicate)
     {
+      current_shares[current_count] = 0.0f;
       memcpy(current_symbols[current_count++], parsed, sizeof(parsed));
       ++generation;
       added = true;
@@ -206,8 +228,10 @@ bool settings_delete_symbol(size_t index)
     for (size_t i = index; i + 1U < current_count; ++i)
     {
       memcpy(current_symbols[i], current_symbols[i + 1U], APP_SYMBOL_LENGTH);
+      current_shares[i] = current_shares[i + 1U];
     }
     memset(current_symbols[current_count - 1U], 0, APP_SYMBOL_LENGTH);
+    current_shares[current_count - 1U] = 0.0f;
     --current_count;
     ++generation;
     deleted = true;
@@ -215,6 +239,53 @@ bool settings_delete_symbol(size_t index)
   taskEXIT_CRITICAL();
   if (deleted) settings_save();
   return deleted;
+}
+
+void settings_get_shares(float shares[APP_MAX_SYMBOLS])
+{
+  taskENTER_CRITICAL();
+  memcpy(shares, current_shares, sizeof(current_shares));
+  taskEXIT_CRITICAL();
+}
+
+bool settings_set_shares(size_t index, float quantity)
+{
+  /* NaN-safe lower bound: !(x >= 0) is true for NaN. */
+  if (!(quantity >= 0.0f) || quantity > 9999999.0f) return false;
+
+  taskENTER_CRITICAL();
+  bool ok = index < current_count;
+  if (ok)
+  {
+    current_shares[index] = quantity;
+    ++generation;
+  }
+  taskEXIT_CRITICAL();
+  if (ok) settings_save();
+  return ok;
+}
+
+bool settings_set_shares_csv(const char *csv)
+{
+  float parsed[APP_MAX_SYMBOLS] = { 0 };
+  size_t count = 0;
+
+  while (count < APP_MAX_SYMBOLS && *csv != '\0')
+  {
+    char *end;
+    float value = strtof(csv, &end);
+    if (end == csv) break;
+    if (!(value >= 0.0f)) value = 0.0f;
+    parsed[count++] = value;
+    csv = end;
+    while (*csv == ',' || *csv == ' ') ++csv;
+  }
+
+  taskENTER_CRITICAL();
+  memcpy(current_shares, parsed, sizeof(current_shares));
+  ++generation;
+  taskEXIT_CRITICAL();
+  return true;
 }
 
 uint32_t settings_get_refresh_seconds(void)

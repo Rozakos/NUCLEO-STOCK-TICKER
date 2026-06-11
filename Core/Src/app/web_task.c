@@ -31,8 +31,10 @@ static size_t append_symbols_page(char *buffer)
 {
   char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
   stock_snapshot_t stocks[APP_MAX_SYMBOLS];
+  float shares[APP_MAX_SYMBOLS];
   size_t symbol_count = settings_get_symbols(symbols);
   size_t stock_count = stock_data_get_all(stocks);
+  settings_get_shares(shares);
   size_t used = 0;
 
   used = append(buffer, used,
@@ -55,16 +57,23 @@ static size_t append_symbols_page(char *buffer)
     {
       if (strcmp(symbols[i], stocks[j].symbol) == 0) found = &stocks[j];
     }
-    char row[220];
+    char row[360];
     if (found != NULL && found->fresh)
     {
-      char price[20], change[20];
+      char price[20], change[20], holding[64] = "";
       format_decimal_2(price, sizeof(price), found->last, 0);
       format_decimal_2(change, sizeof(change), found->change_pct, 1);
+      if (shares[i] > 0.0f)
+      {
+        char value[20];
+        format_decimal_2(value, sizeof(value), shares[i] * found->last, 0);
+        snprintf(holding, sizeof(holding),
+                 "<span class=muted>$%s</span> &nbsp; ", value);
+      }
       snprintf(row, sizeof(row),
-               "<div class=card><strong>%s</strong><span>$%s &nbsp; <span class=%s>%s%%</span></span></div>",
-               symbols[i], price, found->change_pct >= 0.0f ? "up" : "down",
-               change);
+               "<div class=card><strong>%s</strong><span>%s$%s &nbsp; <span class=%s>%s%%</span></span></div>",
+               symbols[i], holding, price,
+               found->change_pct >= 0.0f ? "up" : "down", change);
     }
     else
     {
@@ -75,15 +84,23 @@ static size_t append_symbols_page(char *buffer)
     used = append(buffer, used, row);
   }
 
-  used = append(buffer, used, "<h2>Symbols</h2><table>");
+  used = append(buffer, used,
+                "<h2>Symbols &amp; Shares Owned</h2><table>");
   for (size_t i = 0; i < symbol_count; ++i)
   {
-    char row[220];
+    char row[440];
+    char quantity[20];
+    format_decimal_2(quantity, sizeof(quantity), shares[i], 0);
     snprintf(row, sizeof(row),
-             "<tr><td><strong>%s</strong></td><td class=right>"
+             "<tr><td><strong>%s</strong></td><td>"
+             "<form class=add method=POST action=/shares>"
+             "<input type=hidden name=i value=%u>"
+             "<input name=qty type=number step=any min=0 value=%s style='width:110px;flex:none'>"
+             "<button class=del type=submit>Set</button></form></td>"
+             "<td class=right>"
              "<form method=POST action=/delete><input type=hidden name=i value=%u>"
              "<button class=del type=submit>&times;</button></form></td></tr>",
-             symbols[i], (unsigned)i);
+             symbols[i], (unsigned)i, quantity, (unsigned)i);
     used = append(buffer, used, row);
   }
   used = append(buffer, used, "</table>");
@@ -214,6 +231,19 @@ static void handle_client(int client)
   {
     char *index = form_value(request, "i");
     if (index != NULL) settings_delete_symbol((size_t)strtoul(index, NULL, 10));
+  }
+  else if (strncmp(request, "POST /shares ", 13) == 0)
+  {
+    /* Extract qty BEFORE i: form_value() null-terminates the value at its
+     * trailing '&', which would cut the body off after "i=N" and hide the
+     * qty field. qty is the last field, so reading it first mutates nothing. */
+    char *quantity = form_value(request, "qty");
+    char *index = form_value(request, "i");
+    if (quantity != NULL && index != NULL)
+    {
+      settings_set_shares((size_t)strtoul(index, NULL, 10),
+                          strtof(quantity, NULL));
+    }
   }
   else if (strncmp(request, "POST /settings ", 15) == 0)
   {
