@@ -164,6 +164,18 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-12 — Claude (Fable 5, Claude Code):** Performance: discovered the M7 ran with
+  **both CPU caches OFF** and the Debug build at **-O0**. Added `[tls] handshake Nms` timing
+  to `https_get`, measured baseline **7.7-10.7 s per TLS handshake**. Enabled `SCB_EnableICache()`
+  (USER CODE 1; I-cache has no DMA-coherency hazard — D-cache deliberately still OFF pending
+  ETH descriptor MPU work) and switched the Debug config to **-O2** (.cproject + regenerated-
+  makefile sed; IDE re-syncs on next build). Result, verified on COM4: handshakes now
+  **2.4-2.9 s (~3.7x)**, text shrank 970->686 KB, and the user exercised ALL ranges
+  (1d/1w/1mo/6mo/1y/5y/max) — every one fetched + rendered, no freeze. Next snappiness steps
+  (not done): TLS session resumption (mbedtls_ssl_get/set_session), persistent HTTP/1.1
+  keep-alive connection, D-cache + MPU, API batch-quote endpoint
+  (github.com/Rozakos/stock-api has no multi-symbol quote endpoint yet).
+
 - **2026-06-12 — Claude (Fable 5, Claude Code):** Market-list polish from user feedback:
   (1) list no longer pans — rows are positioned manually (no flex) and the list is
   non-scrollable; every count stretches row heights to fill the 244 px exactly (≤4 one

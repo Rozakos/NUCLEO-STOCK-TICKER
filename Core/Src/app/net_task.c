@@ -109,7 +109,7 @@ void StartNetTask(void const *argument)
     }
     else
     {
-      snprintf(snapshot.symbol, sizeof(snapshot.symbol), "%s", symbol);
+      snprintf(snapshot.symbol, sizeof(snapshot.symbol), "%.11s", symbol);
       snprintf(snapshot.status, sizeof(snapshot.status), "%.47s", error);
       printf("[stock] %s fetch failed: %s\r\n", symbol, error);
     }

@@ -140,6 +140,12 @@ int main(void)
   /* USER CODE BEGIN 1 */
   MPU_Config_SDRAM();
 
+  /* Instruction cache: no DMA-coherency hazards (unlike D-cache), and the
+   * M7 runs several times faster with it - measured TLS handshakes drop
+   * from ~8-9 s. D-cache stays OFF until the ETH DMA descriptor/buffer
+   * MPU regions are configured (AGENTS.md section 7). */
+  SCB_EnableICache();
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/

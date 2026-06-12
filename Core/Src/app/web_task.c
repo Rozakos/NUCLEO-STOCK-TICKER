@@ -88,7 +88,7 @@ static size_t append_symbols_page(char *buffer)
                 "<h2>Symbols &amp; Shares Owned</h2><table>");
   for (size_t i = 0; i < symbol_count; ++i)
   {
-    char row[440];
+    char row[520];
     char quantity[20];
     format_decimal_2(quantity, sizeof(quantity), shares[i], 0);
     snprintf(row, sizeof(row),

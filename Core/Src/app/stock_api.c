@@ -211,6 +211,7 @@ static int https_get(const char *path, char **body, size_t *body_len, char *erro
   }
   mbedtls_ssl_set_bio(&ssl, &socket_fd, socket_send, socket_recv, NULL);
 
+  uint32_t handshake_start = HAL_GetTick();
   while ((ret = mbedtls_ssl_handshake(&ssl)) != 0)
   {
     if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE)
@@ -219,6 +220,8 @@ static int https_get(const char *path, char **body, size_t *body_len, char *erro
       goto cleanup;
     }
   }
+  printf("[tls] handshake %lums\r\n",
+         (unsigned long)(HAL_GetTick() - handshake_start));
 
   char request[768];
   int request_len = snprintf(request, sizeof(request),
