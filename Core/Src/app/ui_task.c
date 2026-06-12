@@ -108,6 +108,11 @@ static bool detail_window_rendered;         /* a history window is on the chart 
 static int detail_range_displayed;
 static int detail_range_pending;
 static lv_color_t detail_line_color;
+/* Auto-refresh: the displayed window is silently re-fetched each refresh
+ * interval so the chart keeps moving while the screen stays up. A silent
+ * fetch re-renders in place (no blank/spinner) and swallows errors. */
+static bool detail_refresh_silent;          /* in-flight request is a refresh */
+static uint32_t detail_request_tick;        /* when the last request was made */
 
 /* Geometry handed to the gradient area-fill draw callback (chart-local). */
 static int detail_fill_n;
@@ -192,6 +197,8 @@ static void start_history_fetch(void)
   lv_obj_clear_flag(detail_spinner, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(detail_spinner);
   lv_obj_invalidate(detail_chart);
+  detail_refresh_silent = false;
+  detail_request_tick = HAL_GetTick();
   detail_history_generation =
       history_data_request(detail_symbol, range_api[detail_range_pending]);
   printf("[ui] history range requested: %s\r\n",
@@ -942,6 +949,19 @@ static void update_detail(void)
     break;
   }
 
+  /* Window on screen and no fetch in flight: silently re-request it once
+   * per refresh interval so the chart tracks the live session. */
+  if (detail_window_rendered &&
+      detail_done_generation == detail_history_generation &&
+      HAL_GetTick() - detail_request_tick >=
+          settings_get_refresh_seconds() * 1000U)
+  {
+    detail_refresh_silent = true;
+    detail_request_tick = HAL_GetTick();
+    detail_history_generation =
+        history_data_request(detail_symbol, range_api[detail_range_displayed]);
+  }
+
   history_snapshot_t history;
   if (!history_data_get(&history)) return;
   if (history.generation != detail_history_generation) return;
@@ -951,6 +971,13 @@ static void update_detail(void)
   if (history.error)
   {
     detail_done_generation = history.generation;
+    /* A failed silent refresh keeps the stale window on screen; the next
+     * interval retries. Only a user-initiated fetch surfaces the error. */
+    if (detail_refresh_silent)
+    {
+      printf("[ui] silent history refresh failed: %s\r\n", history.status);
+      return;
+    }
     lv_obj_add_flag(detail_spinner, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(detail_error_label,
                       history.status[0] != '\0' ? history.status : "no data");
