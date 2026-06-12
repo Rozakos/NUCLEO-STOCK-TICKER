@@ -115,8 +115,9 @@ void StartNetTask(void const *argument)
     }
     stock_data_publish(&snapshot);
 
-    /* Fetch each symbol's logo once (PNG -> SDRAM cache; ui_task displays it). */
-    if (logo_cache_should_fetch(symbol))
+    /* Fetch each symbol's logo once (PNG -> SDRAM cache; ui_task displays
+     * it). AMD is skipped: the UI always uses the bundled green asset. */
+    if (strcmp(symbol, "AMD") != 0 && logo_cache_should_fetch(symbol))
     {
       const uint8_t *png = NULL;
       size_t png_len = 0;

@@ -69,6 +69,10 @@ typedef struct
   lv_obj_t *price;
   lv_obj_t *change;
   bool logo_applied;   /* true once a real logo (bundled or fetched) is shown */
+  int spark_w;         /* sparkline size depends on the row layout */
+  int spark_h;
+  size_t point_count;  /* points currently plotted (for the gradient fill) */
+  lv_color_t spark_color;
   lv_point_precise_t points[STOCK_SPARKLINE_MAX_POINTS];
 } market_row_t;
 
@@ -129,6 +133,7 @@ static const float y_steps[] = {
 
 static void update_detail(void);
 static void create_detail_screen(const char *symbol);
+static void spark_area_fill(lv_event_t *event);
 
 static void row_clicked(lv_event_t *event)
 {
@@ -256,19 +261,26 @@ static lv_color_t brand_color(const char *symbol)
   return lv_color_hex(palette[hash % (sizeof(palette) / sizeof(palette[0]))]);
 }
 
-static void create_badge(market_row_t *market, bool compact)
+/* Compact rows stack [icon above name] on the left; full rows keep the
+ * icon middle-left. `y_offset` shifts the badge off the vertical center
+ * to make room for the name underneath. */
+static void create_badge(market_row_t *market, int size, int y_offset)
 {
-  const int size = compact ? 32 : 38;
   const int scale = (size * 256) / 48;   /* logos are 48px sources */
 
-  const lv_image_dsc_t *api_logo = logo_cache_lookup(market->symbol);
-  if (api_logo != NULL || strcmp(market->symbol, "AMD") == 0)
+  /* AMD always uses the bundled white/green asset: the API serves the
+   * near-black variant, which vanishes on the dark theme. */
+  bool bundled_amd = strcmp(market->symbol, "AMD") == 0;
+  const lv_image_dsc_t *api_logo =
+      bundled_amd ? NULL : logo_cache_lookup(market->symbol);
+  if (api_logo != NULL || bundled_amd)
   {
     market->badge = lv_image_create(market->row);
     lv_image_set_src(market->badge,
-                     api_logo != NULL ? api_logo : &logo_AMD);
+                     bundled_amd ? &logo_AMD : api_logo);
     lv_image_set_scale(market->badge, scale);
     lv_obj_set_size(market->badge, size, size);
+    lv_obj_align(market->badge, LV_ALIGN_LEFT_MID, 0, y_offset);
     lv_obj_clear_flag(market->badge, LV_OBJ_FLAG_CLICKABLE);
     market->logo_applied = true;
     return;
@@ -276,6 +288,7 @@ static void create_badge(market_row_t *market, bool compact)
 
   market->badge = lv_obj_create(market->row);
   lv_obj_set_size(market->badge, size, size);
+  lv_obj_align(market->badge, LV_ALIGN_LEFT_MID, 0, y_offset);
   lv_obj_set_style_radius(market->badge, LV_RADIUS_CIRCLE, 0);
   lv_obj_set_style_bg_color(market->badge, brand_color(market->symbol), 0);
   lv_obj_set_style_border_width(market->badge, 0, 0);
@@ -286,20 +299,19 @@ static void create_badge(market_row_t *market, bool compact)
   lv_obj_t *label = lv_label_create(market->badge);
   lv_label_set_text(label, initial);
   lv_obj_set_style_text_color(label, lv_color_hex(0x0B0F17), 0);
-  lv_obj_set_style_text_font(label, compact ? &lv_font_montserrat_14
-                                            : &lv_font_montserrat_18, 0);
+  lv_obj_set_style_text_font(label, size <= 26 ? &lv_font_montserrat_14
+                                               : &lv_font_montserrat_18, 0);
   lv_obj_center(label);
 }
 
 static void create_market_row(const char *symbol, market_row_t *market,
-                              bool compact)
+                              int width, int height, bool compact)
 {
   memset(market, 0, sizeof(*market));
   snprintf(market->symbol, sizeof(market->symbol), "%s", symbol);
 
   market->row = lv_obj_create(list);
-  lv_obj_set_size(market->row, compact ? ROW_COMPACT_WIDTH : LCD_WIDTH - 12,
-                  ROW_HEIGHT);
+  lv_obj_set_size(market->row, width, height);
   lv_obj_set_style_bg_color(market->row, lv_color_hex(0x16202D), 0);
   lv_obj_set_style_bg_color(market->row, lv_color_hex(0x223349),
                             LV_STATE_PRESSED);
@@ -310,7 +322,9 @@ static void create_market_row(const char *symbol, market_row_t *market,
   lv_obj_clear_flag(market->row, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(market->row, row_clicked, LV_EVENT_CLICKED, market);
 
-  create_badge(market, compact);
+  /* Compact rows stack icon over name on the left, freeing width for the
+   * sparkline; full rows keep them side by side. */
+  create_badge(market, compact ? 24 : 38, compact ? -8 : 0);
 
   market->symbol_label = lv_label_create(market->row);
   lv_label_set_text(market->symbol_label, symbol);
@@ -318,18 +332,35 @@ static void create_market_row(const char *symbol, market_row_t *market,
   lv_obj_set_style_text_font(market->symbol_label,
                              compact ? &lv_font_montserrat_14
                                      : &lv_font_montserrat_18, 0);
-  lv_obj_align(market->symbol_label, LV_ALIGN_LEFT_MID, compact ? 38 : 48, 0);
-
-  if (!compact)
+  if (compact)
   {
-    /* Sparkline only fits the full-width rows; update_spark() skips NULL. */
-    market->spark = lv_line_create(market->row);
-    lv_obj_set_size(market->spark, SPARK_WIDTH, SPARK_HEIGHT);
-    lv_obj_align(market->spark, LV_ALIGN_CENTER, 22, 0);
-    lv_obj_set_style_line_width(market->spark, 2, 0);
-    lv_obj_set_style_line_rounded(market->spark, true, 0);
-    lv_obj_set_style_line_color(market->spark, lv_color_hex(0x8A98AD), 0);
+    lv_obj_align(market->symbol_label, LV_ALIGN_LEFT_MID, 0, 12);
   }
+  else
+  {
+    lv_obj_align(market->symbol_label, LV_ALIGN_LEFT_MID, 48, 0);
+  }
+
+  /* Gradient sparkline in every layout; size adapts to the row. */
+  market->spark_w = compact ? 84 : SPARK_WIDTH;
+  market->spark_h = height - 20;
+  if (market->spark_h < 16) market->spark_h = 16;
+  if (market->spark_h > 48) market->spark_h = 48;
+  market->spark = lv_line_create(market->row);
+  lv_obj_set_size(market->spark, market->spark_w, market->spark_h);
+  if (compact)
+  {
+    lv_obj_align(market->spark, LV_ALIGN_LEFT_MID, 56, 0);
+  }
+  else
+  {
+    lv_obj_align(market->spark, LV_ALIGN_CENTER, 22, 0);
+  }
+  lv_obj_set_style_line_width(market->spark, 2, 0);
+  lv_obj_set_style_line_rounded(market->spark, true, 0);
+  lv_obj_set_style_line_color(market->spark, lv_color_hex(0x8A98AD), 0);
+  lv_obj_add_event_cb(market->spark, spark_area_fill,
+                      LV_EVENT_DRAW_MAIN_BEGIN, market);
 
   market->price = lv_label_create(market->row);
   lv_label_set_text(market->price, "---.--");
@@ -354,27 +385,80 @@ static void rebuild_rows(void)
   list_compact = compact;
 
   lv_obj_clean(list);
-  /* <=4 symbols: one full-width column. 5-8: column-major wrap -> two
-   * side-by-side columns (first four left, rest right), nothing scrolls. */
-  lv_obj_set_flex_flow(list, compact ? LV_FLEX_FLOW_COLUMN_WRAP
-                                     : LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                        compact ? LV_FLEX_ALIGN_SPACE_EVENLY
-                                : LV_FLEX_ALIGN_CENTER);
   row_count = count;
-  for (size_t i = 0; i < row_count; ++i)
+
+  /* Rows are positioned manually and stretched so every count fills the
+   * full list height - no dead space and nothing to scroll or pan.
+   * <=4 symbols: one full-width column. 5-8: two balanced columns
+   * (ceil(n/2) left, rest right); a column with fewer rows simply gets
+   * taller rows. */
+  const int usable_h = LCD_HEIGHT - STATUS_HEIGHT - 2 * ROW_GAP;
+  if (!compact)
   {
-    create_market_row(symbols[i], &rows[i], compact);
+    int height = (usable_h - ((int)count - 1) * ROW_GAP) / (int)count;
+    for (size_t i = 0; i < count; ++i)
+    {
+      create_market_row(symbols[i], &rows[i], LCD_WIDTH - 12, height, false);
+      lv_obj_set_pos(rows[i].row, 6, ROW_GAP + (int)i * (height + ROW_GAP));
+    }
+  }
+  else
+  {
+    const size_t left_count = (count + 1U) / 2U;
+    const int column_gap = LCD_WIDTH - 12 - 2 * ROW_COMPACT_WIDTH;
+    for (size_t column = 0; column < 2U; ++column)
+    {
+      size_t first = column == 0U ? 0U : left_count;
+      size_t column_rows = column == 0U ? left_count : count - left_count;
+      if (column_rows == 0U) break;
+      int height =
+          (usable_h - ((int)column_rows - 1) * ROW_GAP) / (int)column_rows;
+      int x = 6 + (int)column * (ROW_COMPACT_WIDTH + column_gap);
+      for (size_t i = 0; i < column_rows; ++i)
+      {
+        size_t index = first + i;
+        create_market_row(symbols[index], &rows[index], ROW_COMPACT_WIDTH,
+                          height, true);
+        lv_obj_set_pos(rows[index].row, x,
+                       ROW_GAP + (int)i * (height + ROW_GAP));
+      }
+    }
   }
   settings_seen = settings_generation();
+}
+
+/* Subtle gradient under each row's sparkline (same rasterizer as the
+ * detail chart). Drawn before the line so the line stays on top. */
+static void spark_area_fill(lv_event_t *event)
+{
+  market_row_t *market = lv_event_get_user_data(event);
+  if (market == NULL || market->point_count < 2U) return;
+  lv_obj_t *line = lv_event_get_target_obj(event);
+  lv_layer_t *layer = lv_event_get_layer(event);
+  if (line == NULL || layer == NULL) return;
+
+  /* Shared scratch: rows draw sequentially on the UI task. */
+  static int32_t xs[STOCK_SPARKLINE_MAX_POINTS];
+  static int32_t ys[STOCK_SPARKLINE_MAX_POINTS];
+  for (size_t i = 0; i < market->point_count; ++i)
+  {
+    xs[i] = (int32_t)market->points[i].x;
+    ys[i] = (int32_t)market->points[i].y;
+  }
+  lv_area_t coords;
+  lv_obj_get_coords(line, &coords);
+  chart_util_draw_polyline_fill(layer, xs, ys, (int)market->point_count,
+                                coords.x1, coords.y1, market->spark_h,
+                                market->spark_color, LV_OPA_40);
 }
 
 static void update_spark(market_row_t *market, const stock_snapshot_t *snapshot,
                          lv_color_t color)
 {
-  if (market->spark == NULL) return;   /* compact rows have no sparkline */
+  if (market->spark == NULL) return;
   if (snapshot->close_count < 2U)
   {
+    market->point_count = 0;
     lv_line_set_points(market->spark, market->points, 0);
     return;
   }
@@ -392,10 +476,13 @@ static void update_spark(market_row_t *market, const stock_snapshot_t *snapshot,
   for (size_t i = 0; i < snapshot->close_count; ++i)
   {
     market->points[i].x = (lv_value_precise_t)
-        ((i * (SPARK_WIDTH - 2U)) / (snapshot->close_count - 1U));
+        ((i * (size_t)(market->spark_w - 2)) / (snapshot->close_count - 1U));
     market->points[i].y = (lv_value_precise_t)
-        ((maximum - snapshot->closes[i]) * (SPARK_HEIGHT - 4U) / span + 2.0f);
+        ((maximum - snapshot->closes[i]) * (float)(market->spark_h - 4) /
+             span + 2.0f);
   }
+  market->point_count = snapshot->close_count;
+  market->spark_color = color;
   lv_line_set_points(market->spark, market->points, snapshot->close_count);
   lv_obj_set_style_line_color(market->spark, color, 0);
 }
@@ -417,12 +504,14 @@ static void update_rows(void)
       const lv_image_dsc_t *api_logo = logo_cache_lookup(rows[row].symbol);
       if (api_logo != NULL)
       {
-        const int size = list_compact ? 32 : 38;
+        const int size = list_compact ? 24 : 38;
         lv_obj_delete(rows[row].badge);
         rows[row].badge = lv_image_create(rows[row].row);
         lv_image_set_src(rows[row].badge, api_logo);
         lv_image_set_scale(rows[row].badge, (size * 256) / 48);
         lv_obj_set_size(rows[row].badge, size, size);
+        lv_obj_align(rows[row].badge, LV_ALIGN_LEFT_MID, 0,
+                     list_compact ? -8 : 0);
         lv_obj_clear_flag(rows[row].badge, LV_OBJ_FLAG_CLICKABLE);
         rows[row].logo_applied = true;
         printf("[ui] logo applied: %s\r\n", rows[row].symbol);
@@ -1006,17 +1095,12 @@ static void create_market_screen(void)
   list = lv_obj_create(screen);
   lv_obj_set_size(list, LCD_WIDTH, LCD_HEIGHT - STATUS_HEIGHT);
   lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, 0);
-  lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                        LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_row(list, ROW_GAP, 0);
-  lv_obj_set_style_pad_ver(list, ROW_GAP, 0);
+  lv_obj_set_style_pad_all(list, 0, 0);
   lv_obj_set_style_bg_color(list, lv_color_hex(0x0B0F17), 0);
   lv_obj_set_style_border_width(list, 0, 0);
   lv_obj_set_style_radius(list, 0, 0);
-  lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
-  lv_obj_set_style_bg_color(list, lv_color_hex(0xED1C24), LV_PART_SCROLLBAR);
-  lv_obj_set_style_width(list, 4, LV_PART_SCROLLBAR);
+  /* Every layout fills the screen exactly - the list must never pan. */
+  lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
 
   rebuild_rows();
 }
@@ -1067,13 +1151,15 @@ static void create_detail_screen(const char *symbol)
   lv_obj_set_style_pad_column(header, 8, 0);
   lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
 
-  /* Prefer the fetched logo; fall back to the bundled AMD asset, then to a
-   * brand-colored initial badge (mirrors create_badge() for the rows). */
-  const lv_image_dsc_t *api_logo = logo_cache_lookup(symbol);
-  if (api_logo != NULL || strcmp(symbol, "AMD") == 0)
+  /* AMD always uses the bundled white/green asset (the API's PNG is
+   * near-black); others prefer the fetched logo, then an initial badge. */
+  bool bundled_amd = strcmp(symbol, "AMD") == 0;
+  const lv_image_dsc_t *api_logo =
+      bundled_amd ? NULL : logo_cache_lookup(symbol);
+  if (api_logo != NULL || bundled_amd)
   {
     lv_obj_t *logo = lv_image_create(header);
-    lv_image_set_src(logo, api_logo != NULL ? api_logo : &logo_AMD);
+    lv_image_set_src(logo, bundled_amd ? &logo_AMD : api_logo);
     lv_image_set_scale(logo, 213);   /* 48px source -> 40px slot */
     lv_obj_set_size(logo, 40, 40);
   }

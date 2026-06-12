@@ -164,6 +164,21 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-12 — Claude (Fable 5, Claude Code):** Market-list polish from user feedback:
+  (1) list no longer pans — rows are positioned manually (no flex) and the list is
+  non-scrollable; every count stretches row heights to fill the 244 px exactly (≤4 one
+  full-width column; 5-8 two balanced columns, ceil/floor split, the shorter column gets
+  taller rows — no dead space for 5 or 7). (2) AMD always uses the bundled white/green
+  `logo_AMD` asset (API PNG is near-black, invisible on the dark theme); net_task skips the
+  AMD logo fetch. (3) Compact rows stack icon (24 px) above the name, freeing width for an
+  84 px sparkline; all rows (both layouts) now draw a gradient fill under the sparkline via
+  `chart_util_draw_polyline_fill` on `LV_EVENT_DRAW_MAIN_BEGIN` (per-row point/color state in
+  `market_row_t`). Badges are now LEFT_MID-aligned (were top-left, visibly off in tall rows).
+  **1M freeze report**: could NOT reproduce after the priority/yield fix — `AMD 1mo: 22
+  points` and `6mo: 64 points` fetched + rendered fine on COM4. One unexplained mid-session
+  reboot was observed once (no fault print; possibly the user's reset press) — if freezes
+  recur, suspect a HardFault and add a fault-handler UART dump first.
+
 - **2026-06-11 — Claude (Fable 5, Claude Code):** Three UX features (flashed, pending visual
   confirm): (1) **Adaptive market list** — >4 symbols switches the list to two side-by-side
   columns of compact rows (`LV_FLEX_FLOW_COLUMN_WRAP`, 4 per column, no sparkline, smaller
