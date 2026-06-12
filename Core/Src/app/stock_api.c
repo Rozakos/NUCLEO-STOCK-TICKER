@@ -599,6 +599,95 @@ int stock_api_fetch_quote(const char *symbol, stock_snapshot_t *snapshot,
   return 0;
 }
 
+int stock_api_fetch_quotes(char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH],
+                           size_t count, stock_snapshot_t *snapshots,
+                           size_t *fetched_count, char *error,
+                           size_t error_size)
+{
+  char path[192];
+  int used = snprintf(path, sizeof(path), "%s/stocks?symbols=",
+                      STOCK_API_BASE_PATH);
+  for (size_t i = 0; i < count; ++i)
+  {
+    used += snprintf(path + used, sizeof(path) - (size_t)used, "%s%s",
+                     i == 0U ? "" : ",", symbols[i]);
+    if ((size_t)used >= sizeof(path))
+    {
+      snprintf(error, error_size, "symbol list too long");
+      return -1;
+    }
+  }
+
+  char *body;
+  if (https_get(path, &body, NULL, error, error_size) != 0)
+  {
+    return -1;
+  }
+
+  cJSON *root = cJSON_Parse(body);
+  if (root == NULL)
+  {
+    snprintf(error, error_size, "JSON parse failed");
+    return -1;
+  }
+  cJSON *quotes = cJSON_GetObjectItemCaseSensitive(root, "quotes");
+  if (!cJSON_IsArray(quotes))
+  {
+    cJSON_Delete(root);
+    snprintf(error, error_size, "JSON missing quotes");
+    return -1;
+  }
+
+  size_t fetched = 0;
+  cJSON *item;
+  cJSON_ArrayForEach(item, quotes)
+  {
+    if (fetched >= count) break;
+    cJSON *symbol = cJSON_GetObjectItemCaseSensitive(item, "symbol");
+    cJSON *last = cJSON_GetObjectItemCaseSensitive(item, "last");
+    cJSON *change = cJSON_GetObjectItemCaseSensitive(item, "change_pct");
+    cJSON *closes = cJSON_GetObjectItemCaseSensitive(item, "closes");
+    if (!cJSON_IsString(symbol) || !cJSON_IsNumber(last) ||
+        !cJSON_IsNumber(change))
+    {
+      continue;
+    }
+
+    stock_snapshot_t *snapshot = &snapshots[fetched];
+    memset(snapshot, 0, sizeof(*snapshot));
+    snprintf(snapshot->symbol, sizeof(snapshot->symbol), "%.11s",
+             symbol->valuestring);
+    snapshot->last = (float)last->valuedouble;
+    snapshot->change_pct = (float)change->valuedouble;
+    snapshot->fresh = true;
+    snapshot->updated_ms = HAL_GetTick();
+    snprintf(snapshot->status, sizeof(snapshot->status), "Live via HTTPS");
+    if (cJSON_IsArray(closes))
+    {
+      cJSON *point;
+      cJSON_ArrayForEach(point, closes)
+      {
+        if (cJSON_IsNumber(point) &&
+            snapshot->close_count < STOCK_SPARKLINE_MAX_POINTS)
+        {
+          snapshot->closes[snapshot->close_count++] =
+              (float)point->valuedouble;
+        }
+      }
+    }
+    ++fetched;
+  }
+  cJSON_Delete(root);
+
+  if (fetched == 0U)
+  {
+    snprintf(error, error_size, "no quotes in response");
+    return -1;
+  }
+  *fetched_count = fetched;
+  return 0;
+}
+
 int stock_api_fetch_history(const history_request_t *request,
                             history_snapshot_t *snapshot,
                             char *error, size_t error_size)

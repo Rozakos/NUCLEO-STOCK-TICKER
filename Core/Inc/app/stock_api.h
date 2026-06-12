@@ -10,6 +10,13 @@
 void stock_api_init(void);
 int stock_api_fetch_quote(const char *symbol, stock_snapshot_t *snapshot,
                           char *error, size_t error_size);
+/* One GET /stocks?symbols=A,B,C for the whole watchlist. Fills up to
+ * `count` snapshots (symbols the API couldn't quote are simply absent)
+ * and reports how many were returned via `*fetched_count`. */
+int stock_api_fetch_quotes(char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH],
+                           size_t count, stock_snapshot_t *snapshots,
+                           size_t *fetched_count, char *error,
+                           size_t error_size);
 int stock_api_fetch_history(const history_request_t *request,
                             history_snapshot_t *snapshot,
                             char *error, size_t error_size);

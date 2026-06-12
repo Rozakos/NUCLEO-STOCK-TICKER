@@ -164,6 +164,15 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-12 — Claude (Fable 5, Claude Code):** Adopted the API's new **batch quote
+  endpoint** (`GET /stocks?symbols=A,B,C` -> `{"quotes":[{symbol,last,change_pct,closes}]}`,
+  deployed on rozakos.eu and probed live). New `stock_api_fetch_quotes()`; `net_task` now does
+  ONE quote request per refresh cycle (was one per symbol per `refresh/count` slice), then
+  pending logos (preempted by history requests), then sleeps the full refresh interval.
+  Symbols missing from the batch response get a "no quote" status snapshot. Verified on
+  target: boot handshake 2.4 s, then 5 quotes via one request + 4 logos on the same
+  connection; history taps (1d/1mo) fetched with zero handshakes, near-instant.
+
 - **2026-06-12 — Claude (Fable 5, Claude Code):** Snappiness part 2 (all firmware, no API
   changes): (1) **Persistent HTTPS connection** — `stock_api.c` rewritten around one
   long-lived TLS connection (HTTP/1.1 `Connection: keep-alive`); probed the live API first

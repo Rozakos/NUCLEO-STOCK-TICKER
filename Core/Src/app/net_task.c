@@ -49,7 +49,6 @@ void StartNetTask(void const *argument)
   (void)argument;
   char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
   size_t symbol_count = settings_get_symbols(symbols);
-  size_t symbol_index = 0;
   uint32_t settings_seen = settings_generation();
 
   net_wait_for_ip();
@@ -86,39 +85,69 @@ void StartNetTask(void const *argument)
     if (settings_generation() != settings_seen)
     {
       symbol_count = settings_get_symbols(symbols);
-      symbol_index = 0;
       settings_seen = settings_generation();
       stock_data_reset();
       printf("[stock] symbols updated from web UI\r\n");
     }
 
-    stock_snapshot_t snapshot = { 0 };
+    /* One batch request refreshes the whole watchlist (the API's
+     * /stocks endpoint); the keep-alive connection makes it a single
+     * round-trip. */
+    stock_snapshot_t snapshots[APP_MAX_SYMBOLS];
+    size_t fetched = 0;
     char error[96];
-    const char *symbol = symbols[symbol_index];
-
-    printf("[stock] fetching %s...\r\n", symbol);
-    if (stock_api_fetch_quote(symbol, &snapshot, error, sizeof(error)) == 0)
+    printf("[stock] fetching %u symbols...\r\n", (unsigned)symbol_count);
+    if (stock_api_fetch_quotes(symbols, symbol_count, snapshots, &fetched,
+                               error, sizeof(error)) == 0)
     {
-      char price[20];
-      char change[20];
-      format_decimal_2(price, sizeof(price), snapshot.last, 0);
-      format_decimal_2(change, sizeof(change), snapshot.change_pct, 1);
-      printf("[stock] %s %s (%s%%), %u spark points\r\n",
-             snapshot.symbol, price, change,
-             (unsigned)snapshot.close_count);
+      for (size_t i = 0; i < fetched; ++i)
+      {
+        char price[20];
+        char change[20];
+        format_decimal_2(price, sizeof(price), snapshots[i].last, 0);
+        format_decimal_2(change, sizeof(change), snapshots[i].change_pct, 1);
+        printf("[stock] %s %s (%s%%), %u spark points\r\n",
+               snapshots[i].symbol, price, change,
+               (unsigned)snapshots[i].close_count);
+        stock_data_publish(&snapshots[i]);
+      }
+      /* Symbols the API omitted (unknown/failed) get an error status so
+       * the UI shows why they never turn fresh. */
+      for (size_t i = 0; i < symbol_count; ++i)
+      {
+        bool found = false;
+        for (size_t j = 0; j < fetched; ++j)
+        {
+          if (strcmp(symbols[i], snapshots[j].symbol) == 0) found = true;
+        }
+        if (!found)
+        {
+          stock_snapshot_t missing = { 0 };
+          snprintf(missing.symbol, sizeof(missing.symbol), "%.11s",
+                   symbols[i]);
+          snprintf(missing.status, sizeof(missing.status), "no quote");
+          printf("[stock] %s missing from batch response\r\n", symbols[i]);
+          stock_data_publish(&missing);
+        }
+      }
     }
     else
     {
-      snprintf(snapshot.symbol, sizeof(snapshot.symbol), "%.11s", symbol);
-      snprintf(snapshot.status, sizeof(snapshot.status), "%.47s", error);
-      printf("[stock] %s fetch failed: %s\r\n", symbol, error);
+      printf("[stock] batch fetch failed: %s\r\n", error);
     }
-    stock_data_publish(&snapshot);
 
-    /* Fetch each symbol's logo once (PNG -> SDRAM cache; ui_task displays
-     * it). AMD is skipped: the UI always uses the bundled green asset. */
-    if (strcmp(symbol, "AMD") != 0 && logo_cache_should_fetch(symbol))
+    /* Fetch pending logos (PNG -> SDRAM cache; ui_task displays them).
+     * AMD is skipped: the UI always uses the bundled green asset. A
+     * pending history request preempts the remaining logos - they will
+     * be retried next cycle. */
+    for (size_t i = 0; i < symbol_count; ++i)
     {
+      const char *symbol = symbols[i];
+      if (history_data_request_pending()) break;
+      if (strcmp(symbol, "AMD") == 0 || !logo_cache_should_fetch(symbol))
+      {
+        continue;
+      }
       const uint8_t *png = NULL;
       size_t png_len = 0;
       char logo_error[64];
@@ -135,8 +164,7 @@ void StartNetTask(void const *argument)
       }
     }
 
-    symbol_index = (symbol_index + 1U) % symbol_count;
-    wait_for_refresh_or_settings(
-        (settings_get_refresh_seconds() * 1000U) / symbol_count, settings_seen);
+    wait_for_refresh_or_settings(settings_get_refresh_seconds() * 1000U,
+                                 settings_seen);
   }
 }
