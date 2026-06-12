@@ -1,9 +1,11 @@
 #include "app/stock_api.h"
 #include "app/config.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "FreeRTOS.h"
 #include "cJSON.h"
@@ -138,111 +140,198 @@ static int connect_socket(const char *host, uint16_t port, char *error,
   return socket_fd;
 }
 
-static int https_get(const char *path, char **body, size_t *body_len, char *error,
-                     size_t error_size)
+/* ---- Persistent TLS connection ------------------------------------------
+ * Only the net task fetches, so one TLS connection is kept open across
+ * requests (HTTP/1.1 keep-alive): a button tap normally costs a single
+ * round-trip instead of a multi-second handshake. When the server or an
+ * idle timeout drops the socket, the next request reconnects and resumes
+ * the saved TLS session (abbreviated handshake - no key exchange or chain
+ * verification). The probed API (Cloudflare) always returns Content-Length
+ * for identity encoding, so chunked responses are rejected as errors. */
+static bool tls_stack_ready;
+static mbedtls_entropy_context tls_entropy;
+static mbedtls_ctr_drbg_context tls_drbg;
+static mbedtls_ssl_config tls_config;
+static mbedtls_ssl_context tls_ssl;
+static mbedtls_ssl_session tls_session;
+static bool tls_session_valid;
+static int tls_socket = -1;
+
+#define HTTP_RESPONSE_TIMEOUT_MS 20000U
+
+static void tls_disconnect(void)
 {
-  int result = -1;
-  int socket_fd = -1;
-  mbedtls_entropy_context entropy;
-  mbedtls_ctr_drbg_context drbg;
-  mbedtls_ssl_context ssl;
-  mbedtls_ssl_config config;
+  if (tls_socket >= 0)
+  {
+    mbedtls_ssl_close_notify(&tls_ssl);
+    closesocket(tls_socket);
+    tls_socket = -1;
+  }
+}
 
-  mbedtls_entropy_init(&entropy);
-  mbedtls_ctr_drbg_init(&drbg);
-  mbedtls_ssl_init(&ssl);
-  mbedtls_ssl_config_init(&config);
+/* One-time setup of the contexts that persist across connections. */
+static int tls_stack_init(char *error, size_t error_size)
+{
+  if (tls_stack_ready) return 0;
 
-  int ret = mbedtls_entropy_add_source(&entropy, hardware_entropy, NULL, 32,
-                                       MBEDTLS_ENTROPY_SOURCE_STRONG);
+  mbedtls_entropy_init(&tls_entropy);
+  mbedtls_ctr_drbg_init(&tls_drbg);
+  mbedtls_ssl_init(&tls_ssl);
+  mbedtls_ssl_config_init(&tls_config);
+  mbedtls_ssl_session_init(&tls_session);
+
+  int ret = mbedtls_entropy_add_source(&tls_entropy, hardware_entropy, NULL,
+                                       32, MBEDTLS_ENTROPY_SOURCE_STRONG);
   if (ret != 0)
   {
     format_tls_error(error, error_size, "entropy", ret);
-    goto cleanup;
+    return -1;
   }
 
   static const unsigned char personalization[] = "nucleo-stock-ticker";
-  ret = mbedtls_ctr_drbg_seed(&drbg, mbedtls_entropy_func, &entropy,
+  ret = mbedtls_ctr_drbg_seed(&tls_drbg, mbedtls_entropy_func, &tls_entropy,
                               personalization, sizeof(personalization) - 1U);
   if (ret != 0)
   {
     format_tls_error(error, error_size, "DRBG", ret);
-    goto cleanup;
+    return -1;
   }
 
-  ret = mbedtls_ssl_config_defaults(&config, MBEDTLS_SSL_IS_CLIENT,
+  ret = mbedtls_ssl_config_defaults(&tls_config, MBEDTLS_SSL_IS_CLIENT,
                                     MBEDTLS_SSL_TRANSPORT_STREAM,
                                     MBEDTLS_SSL_PRESET_DEFAULT);
   if (ret != 0)
   {
     format_tls_error(error, error_size, "TLS config", ret);
-    goto cleanup;
+    return -1;
   }
 #if TLS_INSECURE_SKIP_VERIFY
-  mbedtls_ssl_conf_authmode(&config, MBEDTLS_SSL_VERIFY_NONE);
+  mbedtls_ssl_conf_authmode(&tls_config, MBEDTLS_SSL_VERIFY_NONE);
 #else
   if (!ca_initialized)
   {
     snprintf(error, error_size, "pinned CA unavailable");
-    goto cleanup;
+    return -1;
   }
-  mbedtls_ssl_conf_ca_chain(&config, &ca_cert, NULL);
-  mbedtls_ssl_conf_authmode(&config, MBEDTLS_SSL_VERIFY_REQUIRED);
+  mbedtls_ssl_conf_ca_chain(&tls_config, &ca_cert, NULL);
+  mbedtls_ssl_conf_authmode(&tls_config, MBEDTLS_SSL_VERIFY_REQUIRED);
 #endif
-  mbedtls_ssl_conf_rng(&config, mbedtls_ctr_drbg_random, &drbg);
+  mbedtls_ssl_conf_rng(&tls_config, mbedtls_ctr_drbg_random, &tls_drbg);
+  mbedtls_ssl_conf_session_tickets(&tls_config,
+                                   MBEDTLS_SSL_SESSION_TICKETS_ENABLED);
 
-  ret = mbedtls_ssl_setup(&ssl, &config);
+  ret = mbedtls_ssl_setup(&tls_ssl, &tls_config);
   if (ret != 0)
   {
     format_tls_error(error, error_size, "TLS setup", ret);
-    goto cleanup;
+    return -1;
   }
-  ret = mbedtls_ssl_set_hostname(&ssl, STOCK_API_HOST);
+  ret = mbedtls_ssl_set_hostname(&tls_ssl, STOCK_API_HOST);
   if (ret != 0)
   {
     format_tls_error(error, error_size, "TLS hostname", ret);
-    goto cleanup;
+    return -1;
   }
 
-  socket_fd = connect_socket(STOCK_API_HOST, STOCK_API_PORT, error, error_size);
-  if (socket_fd < 0)
+  tls_stack_ready = true;
+  return 0;
+}
+
+static int tls_connect(char *error, size_t error_size)
+{
+  if (tls_socket >= 0) return 0;
+
+  int ret = mbedtls_ssl_session_reset(&tls_ssl);
+  if (ret != 0)
   {
-    goto cleanup;
+    format_tls_error(error, error_size, "TLS reset", ret);
+    return -1;
   }
-  mbedtls_ssl_set_bio(&ssl, &socket_fd, socket_send, socket_recv, NULL);
+  if (tls_session_valid &&
+      mbedtls_ssl_set_session(&tls_ssl, &tls_session) != 0)
+  {
+    tls_session_valid = false;   /* resumption is best-effort */
+  }
+
+  tls_socket = connect_socket(STOCK_API_HOST, STOCK_API_PORT, error,
+                              error_size);
+  if (tls_socket < 0) return -1;
+  mbedtls_ssl_set_bio(&tls_ssl, &tls_socket, socket_send, socket_recv, NULL);
 
   uint32_t handshake_start = HAL_GetTick();
-  while ((ret = mbedtls_ssl_handshake(&ssl)) != 0)
+  while ((ret = mbedtls_ssl_handshake(&tls_ssl)) != 0)
   {
     if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE)
     {
       format_tls_error(error, error_size, "TLS handshake", ret);
-      goto cleanup;
+      closesocket(tls_socket);
+      tls_socket = -1;
+      return -1;
     }
   }
   printf("[tls] handshake %lums\r\n",
          (unsigned long)(HAL_GetTick() - handshake_start));
 
+  /* Save the (possibly refreshed) session for the next reconnect. */
+  mbedtls_ssl_session_free(&tls_session);
+  mbedtls_ssl_session_init(&tls_session);
+  tls_session_valid = (mbedtls_ssl_get_session(&tls_ssl, &tls_session) == 0);
+  return 0;
+}
+
+/* Case-insensitive lookup in the NUL-terminated response header block;
+ * returns the start of the value or NULL. */
+static const char *find_header(const char *headers, const char *name)
+{
+  size_t name_len = strlen(name);
+  for (const char *line = strstr(headers, "\r\n"); line != NULL;
+       line = strstr(line + 2, "\r\n"))
+  {
+    const char *field = line + 2;
+    size_t i = 0;
+    while (i < name_len &&
+           tolower((unsigned char)field[i]) ==
+               tolower((unsigned char)name[i]))
+    {
+      ++i;
+    }
+    if (i == name_len && field[i] == ':')
+    {
+      const char *value = field + name_len + 1U;
+      while (*value == ' ') ++value;
+      return value;
+    }
+  }
+  return NULL;
+}
+
+/* One request over the open connection.
+ * Returns 0 on success, -1 on a transport failure (worth a reconnect and
+ * retry), -2 on an HTTP/protocol error (final). */
+static int do_https_request(const char *path, char **body, size_t *body_len,
+                            char *error, size_t error_size)
+{
   char request[768];
   int request_len = snprintf(request, sizeof(request),
-      "GET %s HTTP/1.0\r\n"
+      "GET %s HTTP/1.1\r\n"
       "Host: %s\r\n"
       "User-Agent: NUCLEO-Stock-Ticker/1.0 (STM32F746)\r\n"
-      "Accept: application/json\r\n"
+      "Accept: */*\r\n"
       "Accept-Encoding: identity\r\n"
       "Authorization: Bearer %s\r\n"
-      "Connection: close\r\n\r\n",
+      "Connection: keep-alive\r\n\r\n",
       path, STOCK_API_HOST, STOCK_API_TOKEN);
   if (request_len <= 0 || (size_t)request_len >= sizeof(request))
   {
     snprintf(error, error_size, "request too large");
-    goto cleanup;
+    return -2;
   }
 
+  int ret;
   size_t sent = 0;
   while (sent < (size_t)request_len)
   {
-    ret = mbedtls_ssl_write(&ssl, (unsigned char *)request + sent,
+    ret = mbedtls_ssl_write(&tls_ssl, (unsigned char *)request + sent,
                             (size_t)request_len - sent);
     if (ret > 0)
     {
@@ -252,69 +341,183 @@ static int https_get(const char *path, char **body, size_t *body_len, char *erro
              ret != MBEDTLS_ERR_SSL_WANT_WRITE)
     {
       format_tls_error(error, error_size, "HTTPS write", ret);
-      goto cleanup;
+      return -1;
     }
   }
 
+  /* Read until the header/body split is in the buffer. */
+  uint32_t deadline = HAL_GetTick() + HTTP_RESPONSE_TIMEOUT_MS;
   size_t used = 0;
-  while (used < HTTP_RESPONSE_SIZE - 1U)
+  char *header_end = NULL;
+  while (header_end == NULL)
   {
-    ret = mbedtls_ssl_read(&ssl, (unsigned char *)HTTP_RESPONSE_ADDR + used,
+    if (used >= HTTP_RESPONSE_SIZE - 1U)
+    {
+      snprintf(error, error_size, "response too large");
+      return -2;
+    }
+    if ((int32_t)(HAL_GetTick() - deadline) >= 0)
+    {
+      snprintf(error, error_size, "response timeout");
+      return -1;
+    }
+    ret = mbedtls_ssl_read(&tls_ssl, (unsigned char *)HTTP_RESPONSE_ADDR + used,
                            HTTP_RESPONSE_SIZE - 1U - used);
     if (ret > 0)
     {
       used += (size_t)ret;
+      HTTP_RESPONSE_ADDR[used] = '\0';
+      header_end = strstr(HTTP_RESPONSE_ADDR, "\r\n\r\n");
       continue;
     }
     if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY)
     {
-      break;
+      snprintf(error, error_size, "connection closed");
+      return -1;
     }
     if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE)
     {
       continue;
     }
     format_tls_error(error, error_size, "HTTPS read", ret);
-    goto cleanup;
+    return -1;
+  }
+  *header_end = '\0';   /* terminate the header block for parsing */
+  char *body_start = header_end + 4;
+
+  if (strncmp(HTTP_RESPONSE_ADDR, "HTTP/1.1 200 ", 13) != 0 &&
+      strncmp(HTTP_RESPONSE_ADDR, "HTTP/1.0 200 ", 13) != 0)
+  {
+    char *line_end = strstr(HTTP_RESPONSE_ADDR, "\r\n");
+    if (line_end != NULL) *line_end = '\0';
+    snprintf(error, error_size, "%.40s", HTTP_RESPONSE_ADDR);
+    return -2;
+  }
+
+  const char *transfer = find_header(HTTP_RESPONSE_ADDR, "transfer-encoding");
+  if (transfer != NULL && strncasecmp(transfer, "identity", 8) != 0)
+  {
+    snprintf(error, error_size, "chunked response unsupported");
+    return -2;
+  }
+
+  const char *length_value = find_header(HTTP_RESPONSE_ADDR, "content-length");
+  size_t header_size = (size_t)(body_start - HTTP_RESPONSE_ADDR);
+  size_t have = used - header_size;
+  size_t content_length;
+  bool reusable = true;
+  if (length_value != NULL)
+  {
+    content_length = (size_t)strtoul(length_value, NULL, 10);
+    if (content_length > HTTP_RESPONSE_SIZE - 1U - header_size)
+    {
+      snprintf(error, error_size, "response too large");
+      return -2;
+    }
+    while (have < content_length)
+    {
+      if ((int32_t)(HAL_GetTick() - deadline) >= 0)
+      {
+        snprintf(error, error_size, "response timeout");
+        return -1;
+      }
+      ret = mbedtls_ssl_read(&tls_ssl,
+                             (unsigned char *)HTTP_RESPONSE_ADDR + used,
+                             HTTP_RESPONSE_SIZE - 1U - used);
+      if (ret > 0)
+      {
+        used += (size_t)ret;
+        have += (size_t)ret;
+        continue;
+      }
+      if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY)
+      {
+        snprintf(error, error_size, "connection closed");
+        return -1;
+      }
+      if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+          ret == MBEDTLS_ERR_SSL_WANT_WRITE)
+      {
+        continue;
+      }
+      format_tls_error(error, error_size, "HTTPS read", ret);
+      return -1;
+    }
+  }
+  else
+  {
+    /* No length given: read to close; this connection can't be reused. */
+    reusable = false;
+    for (;;)
+    {
+      if (used >= HTTP_RESPONSE_SIZE - 1U) break;
+      if ((int32_t)(HAL_GetTick() - deadline) >= 0) break;
+      ret = mbedtls_ssl_read(&tls_ssl,
+                             (unsigned char *)HTTP_RESPONSE_ADDR + used,
+                             HTTP_RESPONSE_SIZE - 1U - used);
+      if (ret > 0)
+      {
+        used += (size_t)ret;
+        continue;
+      }
+      if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+          ret == MBEDTLS_ERR_SSL_WANT_WRITE)
+      {
+        continue;
+      }
+      break;   /* closed (or errored) - we have what we have */
+    }
+    content_length = used - header_size;
   }
   HTTP_RESPONSE_ADDR[used] = '\0';
 
-  if (strncmp(HTTP_RESPONSE_ADDR, "HTTP/1.0 200 ", 13) != 0 &&
-      strncmp(HTTP_RESPONSE_ADDR, "HTTP/1.1 200 ", 13) != 0)
+  const char *connection = find_header(HTTP_RESPONSE_ADDR, "connection");
+  if (connection != NULL && strncasecmp(connection, "close", 5) == 0)
   {
-    char *line_end = strstr(HTTP_RESPONSE_ADDR, "\r\n");
-    if (line_end != NULL)
-    {
-      *line_end = '\0';
-    }
-    snprintf(error, error_size, "%.40s", HTTP_RESPONSE_ADDR);
-    goto cleanup;
+    reusable = false;
+  }
+  if (!reusable)
+  {
+    tls_disconnect();
   }
 
-  *body = strstr(HTTP_RESPONSE_ADDR, "\r\n\r\n");
-  if (*body == NULL)
-  {
-    snprintf(error, error_size, "bad HTTP response");
-    goto cleanup;
-  }
-  *body += 4;
+  *body = body_start;
   if (body_len != NULL)
   {
-    *body_len = used - (size_t)(*body - HTTP_RESPONSE_ADDR);
+    *body_len = content_length;
   }
-  result = 0;
+  return 0;
+}
 
-cleanup:
-  if (socket_fd >= 0)
+static int https_get(const char *path, char **body, size_t *body_len,
+                     char *error, size_t error_size)
+{
+  if (tls_stack_init(error, error_size) != 0)
   {
-    mbedtls_ssl_close_notify(&ssl);
-    closesocket(socket_fd);
+    return -1;
   }
-  mbedtls_ssl_free(&ssl);
-  mbedtls_ssl_config_free(&config);
-  mbedtls_ctr_drbg_free(&drbg);
-  mbedtls_entropy_free(&entropy);
-  return result;
+
+  for (int attempt = 0; attempt < 2; ++attempt)
+  {
+    bool reusing = (tls_socket >= 0);
+    if (tls_connect(error, error_size) != 0)
+    {
+      return -1;   /* a fresh connect failed; retrying would do the same */
+    }
+    int result = do_https_request(path, body, body_len, error, error_size);
+    if (result == 0)
+    {
+      return 0;
+    }
+    tls_disconnect();
+    /* Transport failure on a reused connection usually means the server
+     * idled it out - reconnect once and retry. Anything else is final. */
+    if (result != -1 || !reusing)
+    {
+      return -1;
+    }
+  }
+  return -1;
 }
 
 void stock_api_init(void)

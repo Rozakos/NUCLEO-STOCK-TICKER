@@ -13,6 +13,9 @@
 #define MBEDTLS_SSL_EXTENDED_MASTER_SECRET
 #define MBEDTLS_SSL_PROTO_TLS1_2
 #define MBEDTLS_SSL_SERVER_NAME_INDICATION
+/* Session resumption (tickets + IDs): reconnects skip the full key
+ * exchange, cutting the handshake from seconds to a round-trip. */
+#define MBEDTLS_SSL_SESSION_TICKETS
 
 #define MBEDTLS_AES_C
 #define MBEDTLS_ASN1_PARSE_C

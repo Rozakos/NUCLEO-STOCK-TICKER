@@ -140,11 +140,12 @@ int main(void)
   /* USER CODE BEGIN 1 */
   MPU_Config_SDRAM();
 
-  /* Instruction cache: no DMA-coherency hazards (unlike D-cache), and the
-   * M7 runs several times faster with it - measured TLS handshakes drop
-   * from ~8-9 s. D-cache stays OFF until the ETH DMA descriptor/buffer
-   * MPU regions are configured (AGENTS.md section 7). */
+  /* Caches: the MPU regions above keep every DMA-shared memory area
+   * (SDRAM, LwIP heap, ETH descriptors) non-cacheable, and ethernetif.c
+   * invalidates RX buffers; everything else gets the full I+D cache
+   * speedup (TLS handshakes measured ~8-9 s uncached at -O0). */
   SCB_EnableICache();
+  SCB_EnableDCache();
 
   /* USER CODE END 1 */
 
@@ -1583,6 +1584,17 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* MPU layout for running with the D-cache enabled (mirrors ST's
+ * LwIP_HTTP_Server_Netconn_RTOS example for this board):
+ *   region 0: SDRAM 8 MB, normal non-cacheable - framebuffers, LVGL heap,
+ *             TLS/HTTP/web buffers and logo cache stay DMA/LTDC-coherent.
+ *   region 1: 0x20048000 16 KB, normal non-cacheable - the LwIP heap
+ *             (LWIP_RAM_HEAP_POINTER): TX pbuf payloads are read by the
+ *             ETH DMA straight from here.
+ *   region 2: 0x2004C000 1 KB, device-like - the ETH DMA descriptors
+ *             (placed there by the linker script's .lwip_sec).
+ * RX buffers (RX_POOL) stay cacheable: ethernetif.c invalidates each
+ * buffer before handing it to LwIP. */
 static void MPU_Config_SDRAM(void)
 {
   MPU_Region_InitTypeDef region = { 0 };
@@ -1600,6 +1612,26 @@ static void MPU_Config_SDRAM(void)
   region.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
   region.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
   HAL_MPU_ConfigRegion(&region);
+
+  region.Number = MPU_REGION_NUMBER1;
+  region.BaseAddress = 0x20048000U;
+  region.Size = MPU_REGION_SIZE_16KB;
+  region.TypeExtField = MPU_TEX_LEVEL1;
+  region.DisableExec = MPU_INSTRUCTION_ACCESS_ENABLE;
+  region.IsShareable = MPU_ACCESS_NOT_SHAREABLE;
+  region.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  region.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+  HAL_MPU_ConfigRegion(&region);
+
+  region.Number = MPU_REGION_NUMBER2;
+  region.BaseAddress = 0x2004C000U;
+  region.Size = MPU_REGION_SIZE_1KB;
+  region.TypeExtField = MPU_TEX_LEVEL0;
+  region.IsShareable = MPU_ACCESS_SHAREABLE;
+  region.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  region.IsBufferable = MPU_ACCESS_BUFFERABLE;
+  HAL_MPU_ConfigRegion(&region);
+
   HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 }
 

@@ -127,8 +127,11 @@
 #undef  MEMP_NUM_SYS_TIMEOUT
 #define MEMP_NUM_SYS_TIMEOUT    8
 
-/* Give the netconn/socket API a bit more headroom for the HTTPS client later. */
-#define MEM_SIZE                (16 * 1024)
+/* Give the netconn/socket API a bit more headroom for the HTTPS client.
+ * Capped at 15 KB: the heap lives at LWIP_RAM_HEAP_POINTER (0x20048000)
+ * and must stay (with mem.c's bookkeeping overhead) below the ETH DMA
+ * descriptors at 0x2004C000. */
+#define MEM_SIZE                (15 * 1024)
 #undef  MEMP_NUM_NETCONN
 #define MEMP_NUM_NETCONN        8
 #undef  MEMP_NUM_TCP_PCB

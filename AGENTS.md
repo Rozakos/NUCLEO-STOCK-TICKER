@@ -164,6 +164,26 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 
 ## 8. Session log
 
+- **2026-06-12 — Claude (Fable 5, Claude Code):** Snappiness part 2 (all firmware, no API
+  changes): (1) **Persistent HTTPS connection** — `stock_api.c` rewritten around one
+  long-lived TLS connection (HTTP/1.1 `Connection: keep-alive`); probed the live API first
+  (curl): Cloudflare always returns `Content-Length` for identity encoding, so the reader is
+  CL-based (chunked = error, read-to-close fallback marks the connection dead). Transport
+  failure on a REUSED connection auto-reconnects + retries once; HTTP errors are final.
+  (2) **TLS session resumption** — `MBEDTLS_SSL_SESSION_TICKETS` enabled,
+  `mbedtls_ssl_get/set_session` around each reconnect, so post-idle reconnects skip the key
+  exchange. (3) **D-cache enabled** — mirrored ST's LwIP example MPU layout: region 1
+  = 0x20048000 16 KB normal non-cacheable (LwIP heap via `LWIP_RAM_HEAP_POINTER`, ETH DMA
+  reads TX pbufs from it; MEM_SIZE capped 16K→15K so heap+overhead stays under 0x2004C000);
+  region 2 = 0x2004C000 1 KB device (ETH descriptors — `.lwip_sec` now fixed there via new
+  ETHRAM linker region; RAM region shrunk to 288 K; `_estack` pinned at 0x20050000, MSP grows
+  down over SRAM2 like ST's example). RX_POOL stays cacheable (template already does
+  `SCB_InvalidateDCache_by_Addr` per buffer). SD diskio cache maintenance + scratch buffer
+  defines enabled. **Verified on target**: descriptors at 0x2004C000 (map), DHCP, quotes,
+  logos, history, UI all working; boot handshake 2.3 s, then ZERO handshakes — every request
+  reuses the connection (quote cycle + logos ride one socket). Note: D-cache gain on TLS is
+  modest because the mbedTLS arena lives in non-cacheable SDRAM (0xC0040000) by design.
+
 - **2026-06-12 — Claude (Fable 5, Claude Code):** Performance: discovered the M7 ran with
   **both CPU caches OFF** and the Debug build at **-O0**. Added `[tls] handshake Nms` timing
   to `https_get`, measured baseline **7.7-10.7 s per TLS handshake**. Enabled `SCB_EnableICache()`

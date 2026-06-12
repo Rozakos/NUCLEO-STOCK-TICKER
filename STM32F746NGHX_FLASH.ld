@@ -36,15 +36,25 @@
 ENTRY(Reset_Handler)
 
 /* Highest address of the user mode stack */
-_estack = ORIGIN(RAM) + LENGTH(RAM); /* end of "RAM" Ram type memory */
+/* Main stack (MSP: startup + ISRs) stays at the very top of SRAM2 and grows
+   down toward the ETH descriptors at 0x2004C000 (~15 KB of headroom, same
+   layout as ST's LwIP examples). Kept OUT of the linker regions below. */
+_estack = 0x20050000;
 
 _Min_Heap_Size = 0x1000; /* required amount of heap (printf/newlib under FreeRTOS) */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
-/* Memories definition */
+/* Memories definition.
+   The top 32 KB of the 320 KB RAM are reserved outside the linker regions:
+     0x20048000..0x2004BFFF  LwIP heap (LWIP_RAM_HEAP_POINTER, MPU
+                             non-cacheable so ETH DMA reads TX pbufs
+                             coherently with the D-cache enabled)
+     0x2004C000..0x2004C3FF  ETH DMA descriptors (ETHRAM below, MPU device)
+     0x2004C400..0x2004FFFF  main stack (MSP), growing down from _estack */
 MEMORY
 {
-  RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 320K
+  RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 288K
+  ETHRAM (xrw)    : ORIGIN = 0x2004C000,   LENGTH = 1K
   FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 1024K
 }
 
@@ -166,9 +176,9 @@ SECTIONS
   } >RAM
 
   /* Ethernet DMA descriptors (GCC). ethernetif.c places DMARxDscrTab /
-     DMATxDscrTab into these sections; force them into RAM so ETH DMA can
-     write them. NOLOAD = not initialized from FLASH (HAL_ETH_Init sets them).
-     D-cache is currently OFF, so no non-cacheable/MPU region is required. */
+     DMATxDscrTab into these sections. Fixed at 0x2004C000 (ETHRAM) and
+     covered by an MPU device region so they stay coherent with the ETH DMA
+     now that the D-cache is on. NOLOAD: HAL_ETH_Init initializes them. */
   .lwip_sec (NOLOAD) :
   {
     . = ALIGN(4);
@@ -176,7 +186,7 @@ SECTIONS
     *(.TxDecripSection)
     *(.RxArraySection)
     . = ALIGN(4);
-  } >RAM
+  } >ETHRAM
 
   /* User_heap_stack section, used to check that there is enough "RAM" Ram  type memory left */
   ._user_heap_stack :
