@@ -82,8 +82,38 @@ static bool list_compact;   /* true when the list shows two columns */
 static uint32_t settings_seen;
 static lv_obj_t *list;
 static lv_obj_t *link_label;
+static lv_obj_t *eth_icon;     /* hand-drawn RJ45 jack; tracks link color */
+static lv_obj_t *wifi_label;   /* dimmed placeholder until WiFi lands */
 static lv_obj_t *updated_label;
+static lv_obj_t *status_bar;
+static lv_obj_t *title_label;
+static lv_obj_t *moon_icon;    /* crescent = amber disc + bar-colored mask */
+static lv_obj_t *moon_mask;
+static stock_ext_state_t market_ext_state;   /* drives the night palette */
 static lv_obj_t *net_info_panel;   /* modal connection-info popup */
+
+/* Regular-session palette vs the purple-tinted "night" palette shown
+ * while a pre-market or after-hours session is live (Revolut-style). */
+#define DAY_SCREEN_BG     0x0B0F17
+#define DAY_BAR_BG        0x07090D
+#define DAY_ROW_BG        0x16202D
+#define DAY_ROW_PRESSED   0x223349
+#define NIGHT_SCREEN_BG   0x0D0A1E
+#define NIGHT_BAR_BG      0x0A0718
+#define NIGHT_ROW_BG      0x1C1836
+#define NIGHT_ROW_PRESSED 0x2B2452
+
+static lv_color_t row_bg(void)
+{
+  return lv_color_hex(market_ext_state != STOCK_EXT_NONE ? NIGHT_ROW_BG
+                                                         : DAY_ROW_BG);
+}
+
+static lv_color_t row_bg_pressed(void)
+{
+  return lv_color_hex(market_ext_state != STOCK_EXT_NONE ? NIGHT_ROW_PRESSED
+                                                         : DAY_ROW_PRESSED);
+}
 static lv_obj_t *market_screen;
 static lv_obj_t *detail_screen;
 static lv_obj_t *detail_card;
@@ -226,24 +256,29 @@ static void display_flush(lv_display_t *display, const lv_area_t *area,
 {
   (void)area;
   /* Double-buffered page flip: LVGL just finished rendering into `pixels`
-   * (the back buffer). Point the LTDC at it during vertical blanking so the
-   * swap is tear-free, then LVGL renders the next frame into the other buffer.
-   * The vblank wait is timeout-guarded so an unexpected status polarity
-   * degrades to an immediate swap instead of hanging the UI task. */
+   * (the back buffer). The new address goes into the layer's shadow
+   * register and the LTDC applies it atomically in the next vertical
+   * blanking (VBR reload), so a mid-scanout half-old/half-new frame is
+   * impossible. (The old approach polled the ~0.6 ms VSYNC status bit at
+   * 1 ms granularity, routinely missed it and fell back to an immediate
+   * reload - the occasional visible tear.) VBR self-clears once applied;
+   * waiting for that keeps LVGL from drawing into the buffer that is
+   * still being scanned out. */
   if (lv_display_flush_is_last(display))
   {
-    uint32_t deadline = HAL_GetTick() + 20U;
-    while ((hltdc.Instance->CDSR & LTDC_CDSR_VSYNCS) == 0U)
+    LTDC_LAYER(&hltdc, 0)->CFBAR = (uint32_t)pixels;
+    hltdc.Instance->SRCR = LTDC_SRCR_VBR;
+    uint32_t deadline = HAL_GetTick() + 40U;
+    while ((hltdc.Instance->SRCR & LTDC_SRCR_VBR) != 0U)
     {
       if ((int32_t)(HAL_GetTick() - deadline) >= 0)
       {
         break;
       }
-      /* Yield while waiting for vblank: a busy spin here once ate the
-       * timeslices the TCP stack needed during animations. */
+      /* Yield while waiting: a busy spin here once ate the timeslices
+       * the TCP stack needed during animations. */
       osDelay(1);
     }
-    HAL_LTDC_SetAddress(&hltdc, (uint32_t)pixels, 0U);
   }
   lv_display_flush_ready(display);
 }
@@ -319,9 +354,8 @@ static void create_market_row(const char *symbol, market_row_t *market,
 
   market->row = lv_obj_create(list);
   lv_obj_set_size(market->row, width, height);
-  lv_obj_set_style_bg_color(market->row, lv_color_hex(0x16202D), 0);
-  lv_obj_set_style_bg_color(market->row, lv_color_hex(0x223349),
-                            LV_STATE_PRESSED);
+  lv_obj_set_style_bg_color(market->row, row_bg(), 0);
+  lv_obj_set_style_bg_color(market->row, row_bg_pressed(), LV_STATE_PRESSED);
   lv_obj_set_style_border_width(market->row, 0, 0);
   lv_obj_set_style_radius(market->row, 8, 0);
   lv_obj_set_style_pad_hor(market->row, compact ? 7 : 8, 0);
@@ -494,6 +528,47 @@ static void update_spark(market_row_t *market, const stock_snapshot_t *snapshot,
   lv_obj_set_style_line_color(market->spark, color, 0);
 }
 
+/* Swap the market screen between the day palette and the extended-hours
+ * night palette, retitle the status bar and show/hide the crescent moon.
+ * No-op when the session state hasn't changed. */
+static void apply_market_theme(stock_ext_state_t state)
+{
+  if (state == market_ext_state) return;
+  market_ext_state = state;
+  bool night = state != STOCK_EXT_NONE;
+
+  lv_color_t screen_bg = lv_color_hex(night ? NIGHT_SCREEN_BG : DAY_SCREEN_BG);
+  lv_color_t bar_bg = lv_color_hex(night ? NIGHT_BAR_BG : DAY_BAR_BG);
+  lv_obj_set_style_bg_color(market_screen, screen_bg, 0);
+  lv_obj_set_style_bg_color(list, screen_bg, 0);
+  lv_obj_set_style_bg_color(status_bar, bar_bg, 0);
+  for (size_t i = 0; i < row_count; ++i)
+  {
+    lv_obj_set_style_bg_color(rows[i].row, row_bg(), 0);
+    lv_obj_set_style_bg_color(rows[i].row, row_bg_pressed(),
+                              LV_STATE_PRESSED);
+  }
+
+  lv_label_set_text(title_label, state == STOCK_EXT_PRE    ? "PREMARKET"
+                                 : state == STOCK_EXT_POST ? "AFTER HOURS"
+                                                           : "MARKETS");
+  if (night)
+  {
+    /* The mask disc matches the bar so the amber disc reads as a crescent. */
+    lv_obj_set_style_bg_color(moon_mask, bar_bg, 0);
+    lv_obj_clear_flag(moon_icon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(moon_mask, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_update_layout(status_bar);
+    lv_obj_align_to(moon_icon, title_label, LV_ALIGN_OUT_LEFT_MID, -8, 0);
+    lv_obj_align_to(moon_mask, moon_icon, LV_ALIGN_CENTER, 4, -3);
+  }
+  else
+  {
+    lv_obj_add_flag(moon_icon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(moon_mask, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
 static void update_rows(void)
 {
   stock_snapshot_t stocks[APP_MAX_SYMBOLS];
@@ -502,6 +577,17 @@ static void update_rows(void)
   settings_get_shares(shares);
   float portfolio_total = 0.0f;
   bool portfolio_any = false;
+
+  /* Session state comes from whichever symbol reported extended data;
+   * the watchlist is US equities, so one symbol speaks for all. */
+  stock_ext_state_t session = STOCK_EXT_NONE;
+  for (size_t i = 0; i < stock_count; ++i)
+  {
+    if (!stocks[i].fresh || stocks[i].ext_state == STOCK_EXT_NONE) continue;
+    session = stocks[i].ext_state;
+    if (session == STOCK_EXT_PRE) break;
+  }
+  apply_market_theme(session);
 
   for (size_t row = 0; row < row_count; ++row)
   {
@@ -536,21 +622,27 @@ static void update_rows(void)
     }
     if (snapshot == NULL || !snapshot->fresh) continue;
 
+    /* During pre/after-market the extended print owns the labels;
+     * its change % is vs the regular close. */
+    bool extended = snapshot->ext_state != STOCK_EXT_NONE;
+    float shown_price = extended ? snapshot->ext_price : snapshot->last;
+    float shown_pct = extended ? snapshot->ext_change_pct
+                               : snapshot->change_pct;
+
     if (shares[row] > 0.0f)
     {
-      portfolio_total += shares[row] * snapshot->last;
+      portfolio_total += shares[row] * shown_price;
       portfolio_any = true;
     }
 
     char price[20], change[20], text[32];
-    format_decimal_2(price, sizeof(price), snapshot->last, 0);
-    format_decimal_2(change, sizeof(change), snapshot->change_pct, 1);
+    format_decimal_2(price, sizeof(price), shown_price, 0);
+    format_decimal_2(change, sizeof(change), shown_pct, 1);
     lv_label_set_text(rows[row].price, price);
     snprintf(text, sizeof(text), "%s %s%%",
-             snapshot->change_pct >= 0.0f ? LV_SYMBOL_UP : LV_SYMBOL_DOWN,
-             change);
+             shown_pct >= 0.0f ? LV_SYMBOL_UP : LV_SYMBOL_DOWN, change);
     lv_label_set_text(rows[row].change, text);
-    lv_color_t accent = snapshot->change_pct >= 0.0f
+    lv_color_t accent = shown_pct >= 0.0f
         ? lv_color_hex(0x4ADE80) : lv_color_hex(0xF87171);
     lv_obj_set_style_text_color(rows[row].change, accent, 0);
     update_spark(&rows[row], snapshot, accent);
@@ -559,8 +651,15 @@ static void update_rows(void)
   /* Status icon goes red when the link drops or the lease is lost. */
   bool online = netif_is_link_up(&gnetif) &&
                 !ip4_addr_isany_val(*netif_ip4_addr(&gnetif));
-  lv_obj_set_style_text_color(link_label, online ? lv_color_hex(0x4ADE80)
-                                                 : lv_color_hex(0xF87171), 0);
+  lv_color_t link_color = online ? lv_color_hex(0x4ADE80)
+                                 : lv_color_hex(0xF87171);
+  lv_obj_set_style_text_color(link_label, link_color, 0);
+  lv_obj_set_style_border_color(eth_icon, link_color, 0);
+  for (uint32_t child = 0; child < lv_obj_get_child_count(eth_icon); ++child)
+  {
+    lv_obj_set_style_bg_color(lv_obj_get_child(eth_icon, (int32_t)child),
+                              link_color, 0);
+  }
 
   char updated[40];
   if (portfolio_any)
@@ -773,14 +872,40 @@ static void render_history(const history_snapshot_t *history)
 
   lv_chart_refresh(detail_chart);
 
-  /* Header reflects the displayed window: last close + window % change. */
+  /* Header reflects the displayed window: last close + window % change.
+   * 1D is the exception: like the list rows it compares against the
+   * previous session close (derived from the live quote, which the
+   * history feed doesn't carry), so a gap-down day that climbs off the
+   * open still reads red. */
+  stock_snapshot_t live;
+  bool have_live = stock_data_get_symbol(history->symbol, &live) &&
+                   live.fresh;
   float first = closes[0];
   float last = closes[n - 1U];
   float change = first != 0.0f ? (last - first) / first * 100.0f : 0.0f;
+  if (progressive && have_live && live.change_pct > -100.0f)
+  {
+    float prev_close = live.last / (1.0f + live.change_pct / 100.0f);
+    if (prev_close > 0.0f)
+    {
+      change = (last - prev_close) / prev_close * 100.0f;
+    }
+  }
   bool up = change >= 0.0f;
 
+  /* The header price stays on the live quote (extended-hours print when
+   * one is active) so a silent chart refresh doesn't stomp it back to
+   * the session close; the window's last point is only the fallback
+   * before the first quote lands. */
+  float header_price = last;
+  if (have_live)
+  {
+    header_price = live.ext_state != STOCK_EXT_NONE ? live.ext_price
+                                                    : live.last;
+  }
+
   char number[20];
-  format_decimal_2(number, sizeof(number), last, 0);
+  format_decimal_2(number, sizeof(number), header_price, 0);
   lv_label_set_text(detail_price, number);
   format_decimal_2(number, sizeof(number), change, 1);
   snprintf(text, sizeof(text), "%s %s%%",
@@ -900,8 +1025,10 @@ static void update_detail(void)
     {
       continue;
     }
+    bool extended = stocks[i].ext_state != STOCK_EXT_NONE;
+    float live_price = extended ? stocks[i].ext_price : stocks[i].last;
     char price[20];
-    format_decimal_2(price, sizeof(price), stocks[i].last, 0);
+    format_decimal_2(price, sizeof(price), live_price, 0);
     lv_label_set_text(detail_price, price);
 
     /* Holdings line tracks the live quote. */
@@ -923,7 +1050,7 @@ static void update_detail(void)
       char quantity_text[20], value_text[20], holdings[48];
       format_decimal_2(quantity_text, sizeof(quantity_text), quantity, 0);
       format_decimal_2(value_text, sizeof(value_text),
-                       quantity * stocks[i].last, 0);
+                       quantity * live_price, 0);
       snprintf(holdings, sizeof(holdings), "%s sh = $%s", quantity_text,
                value_text);
       lv_label_set_text(detail_holdings, holdings);
@@ -935,14 +1062,15 @@ static void update_detail(void)
 
     if (!detail_window_rendered)
     {
+      float live_pct = extended ? stocks[i].ext_change_pct
+                                : stocks[i].change_pct;
       char pct[20], text[32];
-      format_decimal_2(pct, sizeof(pct), stocks[i].change_pct, 1);
+      format_decimal_2(pct, sizeof(pct), live_pct, 1);
       snprintf(text, sizeof(text), "%s %s%%",
-               stocks[i].change_pct >= 0.0f ? LV_SYMBOL_UP : LV_SYMBOL_DOWN,
-               pct);
+               live_pct >= 0.0f ? LV_SYMBOL_UP : LV_SYMBOL_DOWN, pct);
       lv_label_set_text(detail_change, text);
       lv_obj_set_style_text_color(detail_change,
-                                  stocks[i].change_pct >= 0.0f
+                                  live_pct >= 0.0f
                                       ? lv_color_hex(0x4ADE80)
                                       : lv_color_hex(0xF87171), 0);
     }
@@ -1091,28 +1219,82 @@ static void create_market_screen(void)
   lv_obj_set_style_pad_all(screen, 0, 0);
 
   lv_obj_t *bar = lv_obj_create(screen);
+  status_bar = bar;
   lv_obj_set_size(bar, LCD_WIDTH, STATUS_HEIGHT);
   lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 0);
-  lv_obj_set_style_bg_color(bar, lv_color_hex(0x07090D), 0);
+  lv_obj_set_style_bg_color(bar, lv_color_hex(DAY_BAR_BG), 0);
   lv_obj_set_style_border_width(bar, 0, 0);
   lv_obj_set_style_radius(bar, 0, 0);
   lv_obj_set_style_pad_hor(bar, 8, 0);
   lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
+  /* The symbol font has no RJ45 glyph, so the ethernet icon is drawn:
+   * a port outline with three contact pins, recolored with link state. */
+  eth_icon = lv_obj_create(bar);
+  lv_obj_set_size(eth_icon, 16, 14);
+  lv_obj_set_style_bg_opa(eth_icon, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(eth_icon, 2, 0);
+  lv_obj_set_style_border_color(eth_icon, lv_color_hex(0x4ADE80), 0);
+  lv_obj_set_style_radius(eth_icon, 3, 0);
+  lv_obj_set_style_pad_all(eth_icon, 0, 0);
+  lv_obj_align(eth_icon, LV_ALIGN_LEFT_MID, 0, 0);
+  lv_obj_clear_flag(eth_icon, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(eth_icon, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(eth_icon, link_clicked, LV_EVENT_CLICKED, NULL);
+  for (int pin = 0; pin < 3; ++pin)
+  {
+    lv_obj_t *pin_obj = lv_obj_create(eth_icon);
+    lv_obj_set_size(pin_obj, 2, 4);
+    lv_obj_set_style_bg_color(pin_obj, lv_color_hex(0x4ADE80), 0);
+    lv_obj_set_style_border_width(pin_obj, 0, 0);
+    lv_obj_set_style_radius(pin_obj, 0, 0);
+    lv_obj_align(pin_obj, LV_ALIGN_BOTTOM_MID, (pin - 1) * 4, 0);
+    lv_obj_clear_flag(pin_obj, LV_OBJ_FLAG_CLICKABLE);
+  }
+
   link_label = lv_label_create(bar);
-  lv_label_set_text(link_label, LV_SYMBOL_WIFI " Ethernet");
+  lv_label_set_text(link_label, "Ethernet");
   lv_obj_set_style_text_color(link_label, lv_color_hex(0x4ADE80), 0);
-  lv_obj_align(link_label, LV_ALIGN_LEFT_MID, 0, 0);
+  lv_obj_align(link_label, LV_ALIGN_LEFT_MID, 22, 0);
   /* Tap the icon for the connection-info popup. */
   lv_obj_add_flag(link_label, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_set_ext_click_area(link_label, 10);
   lv_obj_add_event_cb(link_label, link_clicked, LV_EVENT_CLICKED, NULL);
 
-  lv_obj_t *title = lv_label_create(bar);
-  lv_label_set_text(title, "MARKETS");
-  lv_obj_set_style_text_color(title, lv_color_hex(0xE7EEF7), 0);
-  lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
-  lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
+  /* WiFi support is coming; the greyed symbol reserves its spot. */
+  wifi_label = lv_label_create(bar);
+  lv_label_set_text(wifi_label, LV_SYMBOL_WIFI);
+  lv_obj_set_style_text_color(wifi_label, lv_color_hex(0x475569), 0);
+  lv_obj_update_layout(bar);
+  lv_obj_align_to(wifi_label, link_label, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+
+  title_label = lv_label_create(bar);
+  lv_label_set_text(title_label, "MARKETS");
+  lv_obj_set_style_text_color(title_label, lv_color_hex(0xE7EEF7), 0);
+  lv_obj_set_style_text_font(title_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(title_label, LV_ALIGN_CENTER, 0, 0);
+
+  /* Crescent moon for extended-hours sessions: an amber disc with a
+   * bar-colored disc laid over it (no moon glyph in the symbol font).
+   * Positioned next to the title by apply_market_theme(). */
+  moon_icon = lv_obj_create(bar);
+  lv_obj_set_size(moon_icon, 12, 12);
+  lv_obj_set_style_radius(moon_icon, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(moon_icon, lv_color_hex(0xFBBF24), 0);
+  lv_obj_set_style_border_width(moon_icon, 0, 0);
+  lv_obj_set_style_pad_all(moon_icon, 0, 0);
+  lv_obj_clear_flag(moon_icon, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(moon_icon, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(moon_icon, LV_OBJ_FLAG_HIDDEN);
+  moon_mask = lv_obj_create(bar);
+  lv_obj_set_size(moon_mask, 12, 12);
+  lv_obj_set_style_radius(moon_mask, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(moon_mask, lv_color_hex(NIGHT_BAR_BG), 0);
+  lv_obj_set_style_border_width(moon_mask, 0, 0);
+  lv_obj_set_style_pad_all(moon_mask, 0, 0);
+  lv_obj_clear_flag(moon_mask, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(moon_mask, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(moon_mask, LV_OBJ_FLAG_HIDDEN);
 
   updated_label = lv_label_create(bar);
   lv_label_set_text(updated_label, "starting...");

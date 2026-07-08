@@ -11,21 +11,33 @@ display and **Ethernet** networking (WiFi planned later).
 | Touch | XPT2046 (resistive) | FT5336 (capacitive, I2C3) |
 | UI | LVGL 9.x | LVGL 9.x |
 | Net | WiFi | **Ethernet** (LAN8742A RMII) + LwIP |
-| TLS | (ESP) | mbedTLS |
+| TLS | (ESP) | mbedTLS (pinned CA, session resumption, keep-alive) |
 | JSON | ArduinoJson | cJSON |
 | Data | self-hosted yfinance proxy (`rozakos.eu/stocks/api/v1`, bearer token) | same |
 
-## Status
+## Features
 
-Work in progress. Milestones:
-
-- [x] CubeMX skeleton (ETH MAC, LTDC 480×272, SDRAM, DMA2D, SD, FreeRTOS, FATFS)
-- [x] App config/secrets scaffolding, `printf`→USART1 console
-- [ ] **M1** Ethernet bring-up: LwIP + DHCP + DNS + TCP (proven over UART)
-- [ ] **M2** mbedTLS HTTPS client → live JSON parsed (cJSON)
-- [ ] **M3** LVGL on LTDC + DMA2D, FT5336 touch
-- [ ] **M4** UI port: price/change, sparkline, trend screen, SD-card logos
-- [ ] Later: web admin, WiFi
+- **Live watchlist** (up to 8 symbols): price, day change %, gradient sparkline,
+  API-fetched company logos. One batch HTTPS request per refresh cycle over a
+  persistent TLS connection. Adaptive layout: ≤4 symbols one full-width column,
+  5–8 two compact columns — never scrolls.
+- **Extended hours (Revolut-style)**: during pre-market / after-hours the rows and
+  detail header show the extended print and its change vs regular close, the status
+  bar retitles to PREMARKET / AFTER HOURS with a crescent moon, and the whole market
+  screen shifts to a purple-tinted night palette.
+- **Detail screen** per symbol: smoothed gradient chart with price/date ticks,
+  1D/1W/1M/6M/1Y/5Y/Max ranges, progressive 1D session chart, silent auto-refresh
+  each interval. 1D change/color is anchored to the previous close (not the open).
+- **Web admin** at `http://<board-ip>/`: add/delete symbols, shares owned
+  (portfolio total on the status bar), refresh interval.
+- **Persistent settings**: saved to a microSD card (`ticker.cfg`) when present,
+  otherwise to **internal flash sector 7** (0x080C0000) — watchlist, shares and
+  refresh interval survive power cycles with no SD card. Note: a flash save stalls
+  the CPU ~1 s (sector erase, single-bank XIP); unchanged saves are skipped.
+- **Tear-free display**: double-buffered SDRAM framebuffers; buffer swaps are queued
+  in the LTDC shadow registers and applied by hardware in vertical blanking.
+- Status bar: hand-drawn ethernet jack icon (green/red with link/DHCP state, tap for
+  a connection-info popup) + dimmed WiFi icon reserved for future WiFi support.
 
 ## Build
 
@@ -33,9 +45,26 @@ Work in progress. Milestones:
 - Copy `Core/Inc/app/secrets.h.example` → `Core/Inc/app/secrets.h` and set your
   `STOCK_API_TOKEN`. `secrets.h` is git-ignored.
 - Console: USART1 via the ST-Link VCP, **115200 8N1**.
+- The linker caps the image at **768 KB**: flash sector 7 is reserved for the
+  settings store. A build that outgrows it fails to link instead of corrupting
+  saved settings.
+
+## Milestones
+
+- [x] CubeMX skeleton (ETH MAC, LTDC 480×272, SDRAM, DMA2D, SD, FreeRTOS, FATFS)
+- [x] App config/secrets scaffolding, `printf`→USART1 console
+- [x] **M1** Ethernet bring-up: LwIP + DHCP + DNS + TCP
+- [x] **M2** mbedTLS HTTPS client → live JSON parsed (cJSON), pinned CA
+- [x] **M3** LVGL on LTDC + DMA2D, FT5336 touch, double buffering
+- [x] **M4** UI port: watchlist, sparklines, detail charts, logos, web admin
+- [x] Extended-hours quotes + night theme, settings persistence (SD or flash)
+- [ ] 1D chart pre/post-market segments (blocked on API `prepost` history support)
+- [ ] WiFi as alternate netif
 
 ## Hardware notes
 
-- Framebuffer lives in external SDRAM at `0xC0000000` (FMC).
-- D-cache + MPU must be configured for the ETH DMA descriptor/buffer region and
-  the SDRAM framebuffer (cribbed from ST's `LwIP_HTTP_Server_Netconn_RTOS` example).
+- Framebuffers live in external SDRAM at `0xC0000000`/`0xC0080000` (FMC); TLS heap,
+  HTTP buffer, LVGL heap and logo cache also sit in SDRAM.
+- D-cache + MPU are configured for the ETH DMA descriptor/buffer region and SDRAM
+  (layout cribbed from ST's `LwIP_HTTP_Server_Netconn_RTOS` example).
+- Settings store: flash sector 7 (256 KB @ `0x080C0000`), magic + checksum guarded.

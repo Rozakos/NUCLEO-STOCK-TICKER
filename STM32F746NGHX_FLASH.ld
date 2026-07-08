@@ -55,7 +55,10 @@ MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 288K
   ETHRAM (xrw)    : ORIGIN = 0x2004C000,   LENGTH = 1K
-  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 1024K
+  /* Sector 7 (256K at 0x080C0000) is reserved for the persistent settings
+   * store (settings.c); capping LENGTH makes the linker fail loudly if the
+   * image ever grows into it. */
+  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 768K
 }
 
 /* Sections */

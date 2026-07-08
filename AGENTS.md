@@ -21,7 +21,13 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
   WiFi is a later milestone.
 - JSON: **cJSON** (source used ArduinoJson).
 - Data: self-hosted yfinance proxy `https://rozakos.eu/stocks/api/v1`, bearer-token auth.
-  Endpoints: `GET /stock/{symbol}` and `GET /history/{symbol}?range=1D|1W|1M|6M|1Y|5Y|Max`.
+  Endpoints: `GET /stocks?symbols=A,B,C` (batch quotes), `GET /stock/{symbol}`,
+  `GET /history/{symbol}?range=1d|1w|1mo|6mo|1y|5y|max`, `GET /logo/{symbol}?size=48`.
+  Quotes carry extended-hours fields: `market_state` (PRE/REGULAR/POST/CLOSED),
+  `pre_market`/`pre_market_change_pct` (non-null only during PRE) and
+  `post_market`/`post_market_change_pct` (POST/CLOSED); change % is vs regular close.
+  History is regular-session only (no prepost, no prev_close) as of 2026-07-08 —
+  a `prepost=1` extension has been requested for pre-market 1D charts.
 
 ## 2. Hardware / toolchain facts
 
@@ -79,6 +85,19 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
       mode renders into the back buffer, `display_flush` swaps the LTDC address during vblank) —
       fixes the full-screen blink on scroll / detail screen. (Optional later: LVGL DMA2D draw unit
       for render accel.)
+- [x] **Extended hours + night theme (2026-07-08)**: snapshots carry
+      `ext_state/ext_price/ext_change_pct`; during PRE/POST the rows, detail header and
+      portfolio total follow the extended print, the status bar shows PREMARKET/AFTER HOURS
+      with a drawn crescent moon, and the market screen switches to a purple night palette
+      (`apply_market_theme` in ui_task.c). Verified live during after-hours.
+- [x] **Settings persistence without SD (2026-07-08)**: flash sector 7 blob
+      (`0x080C0000`, magic+checksum, skip-if-unchanged) as fallback when SD is absent;
+      linker FLASH capped at 768K to reserve the sector. Verified end-to-end on target
+      (web-UI add → reboot → loaded from flash). Sector erase stalls the CPU ~1 s.
+- [x] **Tear-free page flip (2026-07-08)**: `display_flush` writes the layer shadow
+      CFBAR + VBR reload (hardware applies in vblank) instead of polling the ~0.6 ms
+      VSYNC status bit — the old poll missed it and fell back to an immediate mid-scanout
+      reload, the user-visible "half screen" glitch.
 - [~] **M4 UI**: live quote snapshots update symbol, price, percentage, HTTPS status, and
       sparkline. Now **multi-symbol** (default AMD, NVDA, AAPL, MSFT, TSLA; configurable via web
       admin up to APP_MAX_SYMBOLS=8). Tapping any row opens a detail screen (AMD shows its logo;
@@ -90,49 +109,31 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
       highlight (pending vs displayed split), and a progressive 1D session chart
       (`session_open`/`session_close` parsed from the API). Flashed 2026-06-11; awaiting
       visual confirmation.
-- [~] **Web admin**: runtime symbol add/delete and refresh interval work at
-      `http://<board-ip>/`. Settings load/save atomically through `ticker.cfg` on SD when a
-      formatted card is available; target currently reports SD unavailable.
+- [x] **Web admin**: runtime symbol add/delete, shares and refresh interval work at
+      `http://<board-ip>/`. Settings persist through `ticker.cfg` on SD when a formatted
+      card is available, else the flash sector-7 blob (this board has no SD card).
 - [x] **TLS verification**: `rozakos.eu` hostname and certificate chain are verified against
       the pinned Google Trust Services WE1 intermediate (valid through 2029-02-20).
 - [ ] Later: WiFi as alternate netif.
 
 ## 6. NEXT ACTION (start here)
 
-**M1 is verified complete.** On-target output:
-```
-[eth] link UP (100M/full)
-[net] DHCP bound. IP  = 192.168.1.154
-[net] DNS rozakos.eu -> 172.67.155.109
-[net] TCP connect OK (stack reaches the API host)
-```
-
-**M1 root cause (FIXED and verified):** CubeMX generated no project
-`HAL_ETH_MspInit()` override. `HAL_ETH_Init()` therefore called the HAL weak no-op, leaving
-ETH clocks, RMII GPIO alternate functions, and the ETH IRQ unconfigured. `ethernetif.c` now
-implements the STM32F746G-DISCO RMII MSP setup inside USER CODE 3 and calls
-`HAL_ETH_SetMDIOClockRange()` after HAL init. PHY reads now report MDIO failures explicitly
-instead of treating every failure as link-down.
+Everything through extended hours + persistence is verified on target (2026-07-08).
 
 **DO THIS NEXT:**
-1. Visually verify the new CYD-style detail screen (flashed 2026-06-11, not yet confirmed):
-   tap a row → spinner over a blank chart card → smoothed gradient chart with Y price ticks
-   and X date/time ticks. 1D must span the whole session (line stops at "now", marker dot at
-   the end); other ranges fill the width with date labels. Tap each range button: highlight
-   moves instantly, spinner shows, chart + window % catch up. On fetch failure a red error
-   label appears and the highlight reverts. Expected UART:
-   ```
-   [ui] row clicked: AMD
-   [ui] history range requested: 1mo
-   [history] fetching AMD 1mo...
-   [history] AMD 1mo: <n> points
-   [ui] AMD 1mo rendered: <n> points
-   ```
-2. Web admin is verified at `http://192.168.1.154/` on the current DHCP lease. The current
-   address is always printed at boot as `[web] admin ready: http://<ip>/`.
-3. Possible next UI work: gradient/area-fill sparklines on the market list rows (CYD parity),
-   chart X-label times use fixed `APP_UTC_OFFSET_MINUTES` (config.h, currently EEST +180) —
-   could become a web-admin setting; flash is at 970 KB of 1 MB (watch `-O0` Debug growth).
+1. **Pre-market 1D chart segments** — blocked on the API. A `prepost=1` extension for
+   `GET /history/{symbol}?range=1d` has been requested (extended-window points +
+   `window_open`/`window_close` + `market_state` + `prev_close`; see the prompt in the
+   2026-07-08 session log context). Once deployed: request with `prepost=1` during
+   PRE/POST, draw points outside `session_open..session_close` in the amber accent
+   (0xFBBF24, matches the moon), divider at the regular open, and use `prev_close`
+   directly instead of deriving it from the live quote in `render_history`.
+2. WiFi as an alternate netif (the status bar already reserves a dimmed WiFi icon).
+3. Debugging a hang/crash? See the device-debug workflow: serial on COM4, web-UI POSTs
+   via `Invoke-WebRequest -UseBasicParsing`, and hot-attach forensics with
+   `STM32_Programmer_CLI -c port=SWD mode=HOTPLUG -r32/-coreReg` +
+   `arm-none-eabi-addr2line`. A FreeRTOS stack overflow presents as total silent death
+   (the hook's printf is swallowed by the UART HAL lock).
 
 ### (done) Enabling LwIP in CubeMX — kept for reference
 Open `NUCLEO-STOCK-TICKER.ioc`:
@@ -163,6 +164,35 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 - Many Disco peripherals are enabled but unused (DCMI/SAI/SPDIF/QSPI/USB host) — ignore them.
 
 ## 8. Session log
+
+- **2026-07-08 — Claude (Fable 5, Claude Code):** Extended-hours support + three fixes,
+  all verified on target during live after-hours. (1) **Pre/after-market quotes**:
+  API now nulls `pre_market`/`post_market` outside their session, so
+  `parse_extended_hours()` (both quote paths) keys off numeric presence; snapshots
+  gained `ext_state/ext_price/ext_change_pct`. Rows/detail/portfolio follow the
+  extended print; status bar retitles PREMARKET/AFTER HOURS with a two-disc crescent
+  moon; market screen swaps to a purple night palette on session transitions only.
+  (2) **1D chart colored by day change**: was first→last of the window (green on a
+  gap-down day that climbed off the open); now anchored to prev close derived from the
+  live quote (`last/(1+pct/100)`) — history API carries no prev_close (requested,
+  with `prepost=1`, from the API side). (3) **Graph-tab "not refreshing"**:
+  `render_history` stomped the header price back to the session close on every silent
+  refresh; header now prefers the live extended-aware quote. (4) **Half-screen glitch**
+  = real tearing: vsync poll (1 ms granularity vs ~0.6 ms pulse) missed → timeout →
+  immediate mid-scanout reload; replaced with CFBAR shadow write + VBR reload (hardware
+  swaps in vblank). (5) **Settings persistence without SD**: board has no card
+  (`[settings] SD unavailable` meant `storage_ready` stayed false and saves no-op'd);
+  added a flash sector-7 blob store (magic+checksum, skip-if-unchanged, D-cache
+  invalidate around program), SD → flash → defaults load order, linker FLASH capped at
+  768K. First on-target save **hard-hung the board**: hot-attach forensics (PC in
+  `vApplicationStackOverflowHook`, `pxCurrentTCB->pcTaskName` = "webTask") showed the
+  save frames overflowed the 8 KB web stack — and the overflow hook prints nothing
+  because the interrupted printf holds the UART HAL lock. webTask 2048→4096 words,
+  uiTask 2048→3072 (update_rows→update_detail nests two ~2.8 KB snapshot arrays),
+  save blob made static. Round-trip verified: add symbol → `saved to flash` → reboot →
+  `loaded from flash` → delete → clean save, device alive throughout. Also: ethernet
+  status icon is now a drawn RJ45 jack (no glyph in the LVGL symbol font) + dimmed
+  WiFi placeholder; `stock_data_get_symbol()` accessor added.
 
 - **2026-06-12 — Claude (Fable 5, Claude Code):** Adopted the API's new **batch quote
   endpoint** (`GET /stocks?symbols=A,B,C` -> `{"quotes":[{symbol,last,change_pct,closes}]}`,

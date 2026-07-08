@@ -53,6 +53,25 @@ bool stock_data_get(stock_snapshot_t *snapshot)
   return available;
 }
 
+bool stock_data_get_symbol(const char *symbol, stock_snapshot_t *snapshot)
+{
+  bool found = false;
+
+  taskENTER_CRITICAL();
+  for (size_t i = 0; i < snapshot_count; ++i)
+  {
+    if (strcmp(snapshots[i].symbol, symbol) == 0)
+    {
+      *snapshot = snapshots[i];
+      found = true;
+      break;
+    }
+  }
+  taskEXIT_CRITICAL();
+
+  return found;
+}
+
 size_t stock_data_get_all(stock_snapshot_t output[APP_MAX_SYMBOLS])
 {
   taskENTER_CRITICAL();

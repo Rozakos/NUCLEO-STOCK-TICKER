@@ -545,6 +545,40 @@ void stock_api_init(void)
   api_initialized = true;
 }
 
+/* The API nulls the extended-hours fields outside their session (pre_market
+ * only during PRE, post_market during POST/CLOSED), so a numeric value is
+ * the signal that one is active. Change percentages are vs regular close. */
+static void parse_extended_hours(const cJSON *quote,
+                                 stock_snapshot_t *snapshot)
+{
+  const cJSON *price = cJSON_GetObjectItemCaseSensitive(quote, "pre_market");
+  const cJSON *pct =
+      cJSON_GetObjectItemCaseSensitive(quote, "pre_market_change_pct");
+  stock_ext_state_t state = STOCK_EXT_PRE;
+  if (!cJSON_IsNumber(price))
+  {
+    price = cJSON_GetObjectItemCaseSensitive(quote, "post_market");
+    pct = cJSON_GetObjectItemCaseSensitive(quote, "post_market_change_pct");
+    state = STOCK_EXT_POST;
+  }
+  if (!cJSON_IsNumber(price))
+  {
+    return;
+  }
+
+  snapshot->ext_state = state;
+  snapshot->ext_price = (float)price->valuedouble;
+  if (cJSON_IsNumber(pct))
+  {
+    snapshot->ext_change_pct = (float)pct->valuedouble;
+  }
+  else if (snapshot->last != 0.0f)
+  {
+    snapshot->ext_change_pct =
+        (snapshot->ext_price - snapshot->last) / snapshot->last * 100.0f;
+  }
+}
+
 int stock_api_fetch_quote(const char *symbol, stock_snapshot_t *snapshot,
                           char *error, size_t error_size)
 {
@@ -594,6 +628,7 @@ int stock_api_fetch_quote(const char *symbol, stock_snapshot_t *snapshot,
       }
     }
   }
+  parse_extended_hours(root, snapshot);
 
   cJSON_Delete(root);
   return 0;
@@ -675,6 +710,7 @@ int stock_api_fetch_quotes(char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH],
         }
       }
     }
+    parse_extended_hours(item, snapshot);
     ++fetched;
   }
   cJSON_Delete(root);

@@ -10,6 +10,7 @@
 #include "fatfs.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "stm32f7xx_hal.h"
 
 static char current_symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
 static float current_shares[APP_MAX_SYMBOLS];  /* owned qty, index-aligned */
@@ -17,10 +18,116 @@ static size_t current_count;
 static uint32_t generation;
 static uint32_t refresh_seconds;
 static bool storage_ready;
+static bool sd_ready;
+
+/* ---- Internal-flash store ------------------------------------------------
+ * Boards without a readable SD card persist settings in flash sector 7
+ * (256 KB at 0x080C0000), which the linker reserves (FLASH capped at 768K).
+ * A sector erase stalls the CPU for ~1 s (single-bank XIP), so saves skip
+ * rewriting when the blob is unchanged. */
+#define SETTINGS_FLASH_ADDR  0x080C0000U
+#define SETTINGS_FLASH_MAGIC 0x53544B31U   /* "STK1" */
+
+typedef struct
+{
+  uint32_t magic;
+  uint32_t refresh;
+  uint32_t count;
+  char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
+  float shares[APP_MAX_SYMBOLS];
+  uint32_t checksum;
+} settings_blob_t;
+
+static uint32_t blob_checksum(const settings_blob_t *blob)
+{
+  const uint8_t *bytes = (const uint8_t *)blob;
+  uint32_t sum = 0x5A17U;
+  for (size_t i = 0; i < offsetof(settings_blob_t, checksum); ++i)
+  {
+    sum = sum * 31U + bytes[i];
+  }
+  return sum;
+}
+
+static void flash_save(void)
+{
+  /* Static: settings mutations all come from the web task, and the web
+   * task's stack margin is what overflowed when this lived on it. */
+  static settings_blob_t blob;
+  memset(&blob, 0, sizeof(blob));
+  blob.magic = SETTINGS_FLASH_MAGIC;
+  taskENTER_CRITICAL();
+  blob.refresh = refresh_seconds;
+  blob.count = (uint32_t)current_count;
+  memcpy(blob.symbols, current_symbols, sizeof(blob.symbols));
+  memcpy(blob.shares, current_shares, sizeof(blob.shares));
+  taskEXIT_CRITICAL();
+  blob.checksum = blob_checksum(&blob);
+
+  /* The stored copy may sit stale in the D-cache from an earlier read. */
+  SCB_InvalidateDCache_by_Addr((uint32_t *)SETTINGS_FLASH_ADDR,
+                               (int32_t)sizeof(blob));
+  if (memcmp((const void *)SETTINGS_FLASH_ADDR, &blob, sizeof(blob)) == 0)
+  {
+    return;   /* unchanged: spare the sector and the erase stall */
+  }
+
+  HAL_FLASH_Unlock();
+  FLASH_EraseInitTypeDef erase = {
+    .TypeErase = FLASH_TYPEERASE_SECTORS,
+    .Sector = FLASH_SECTOR_7,
+    .NbSectors = 1U,
+    .VoltageRange = FLASH_VOLTAGE_RANGE_3,
+  };
+  uint32_t bad_sector;
+  HAL_StatusTypeDef status = HAL_FLASHEx_Erase(&erase, &bad_sector);
+  const uint32_t *words = (const uint32_t *)&blob;
+  for (size_t i = 0; status == HAL_OK && i < sizeof(blob) / 4U; ++i)
+  {
+    status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD,
+                               SETTINGS_FLASH_ADDR + 4U * i, words[i]);
+  }
+  HAL_FLASH_Lock();
+  SCB_InvalidateDCache_by_Addr((uint32_t *)SETTINGS_FLASH_ADDR,
+                               (int32_t)sizeof(blob));
+  printf(status == HAL_OK ? "[settings] saved to flash\r\n"
+                          : "[settings] flash save failed\r\n");
+}
+
+static bool flash_load(void)
+{
+  const settings_blob_t *blob = (const settings_blob_t *)SETTINGS_FLASH_ADDR;
+  if (blob->magic != SETTINGS_FLASH_MAGIC || blob->count == 0U ||
+      blob->count > APP_MAX_SYMBOLS || blob->checksum != blob_checksum(blob))
+  {
+    printf("[settings] no flash config; using defaults\r\n");
+    return false;
+  }
+
+  taskENTER_CRITICAL();
+  current_count = blob->count;
+  memcpy(current_symbols, blob->symbols, sizeof(current_symbols));
+  for (size_t i = 0; i < APP_MAX_SYMBOLS; ++i)
+  {
+    current_symbols[i][APP_SYMBOL_LENGTH - 1U] = '\0';
+    current_shares[i] = blob->shares[i] >= 0.0f ? blob->shares[i] : 0.0f;
+  }
+  if (blob->refresh >= 15U && blob->refresh <= 3600U)
+  {
+    refresh_seconds = blob->refresh;
+  }
+  ++generation;
+  taskEXIT_CRITICAL();
+  printf("[settings] loaded from flash\r\n");
+  return true;
+}
 
 static void settings_save(void)
 {
   if (!storage_ready) return;
+
+  flash_save();
+  if (!sd_ready) return;
 
   char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
   size_t count = settings_get_symbols(symbols);
@@ -85,41 +192,52 @@ void settings_init(void)
 
 void settings_storage_load(void)
 {
-  if (f_mount(&SDFatFS, SDPath, 1) != FR_OK)
-  {
-    printf("[settings] SD unavailable; using defaults\r\n");
-    return;
-  }
+  bool loaded = false;
 
-  char path[24];
-  snprintf(path, sizeof(path), "%sticker.cfg", SDPath);
-  FIL file;
-  if (f_open(&file, path, FA_READ) == FR_OK)
+  if (f_mount(&SDFatFS, SDPath, 1) == FR_OK)
   {
-    char line[128];
-    while (f_gets(line, sizeof(line), &file) != NULL)
+    sd_ready = true;
+    char path[24];
+    snprintf(path, sizeof(path), "%sticker.cfg", SDPath);
+    FIL file;
+    if (f_open(&file, path, FA_READ) == FR_OK)
     {
-      char *newline = strpbrk(line, "\r\n");
-      if (newline != NULL) *newline = '\0';
-      if (strncmp(line, "symbols=", 8) == 0)
+      char line[128];
+      while (f_gets(line, sizeof(line), &file) != NULL)
       {
-        settings_set_symbols_csv(line + 8);
+        char *newline = strpbrk(line, "\r\n");
+        if (newline != NULL) *newline = '\0';
+        if (strncmp(line, "symbols=", 8) == 0)
+        {
+          settings_set_symbols_csv(line + 8);
+        }
+        else if (strncmp(line, "shares=", 7) == 0)
+        {
+          settings_set_shares_csv(line + 7);
+        }
+        else if (strncmp(line, "refresh=", 8) == 0)
+        {
+          settings_set_refresh_seconds((uint32_t)strtoul(line + 8, NULL, 10));
+        }
       }
-      else if (strncmp(line, "shares=", 7) == 0)
-      {
-        settings_set_shares_csv(line + 7);
-      }
-      else if (strncmp(line, "refresh=", 8) == 0)
-      {
-        settings_set_refresh_seconds((uint32_t)strtoul(line + 8, NULL, 10));
-      }
+      f_close(&file);
+      loaded = true;
+      printf("[settings] loaded from SD\r\n");
     }
-    f_close(&file);
-    printf("[settings] loaded from SD\r\n");
+    else
+    {
+      printf("[settings] no SD config\r\n");
+    }
   }
   else
   {
-    printf("[settings] no SD config; using defaults\r\n");
+    printf("[settings] SD unavailable\r\n");
+  }
+
+  /* No SD (or an empty card): the internal-flash blob is the fallback. */
+  if (!loaded)
+  {
+    flash_load();
   }
   storage_ready = true;
 }

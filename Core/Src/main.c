@@ -1667,12 +1667,16 @@ void StartDefaultTask(void const * argument)
    * continuous LVGL rendering (e.g. the detail-screen loading spinner) at
    * AboveNormal starved the TCP stack, the board stopped ACKing mid-TLS
    * handshake and the server reset the connection (-0x004E SEND_FAILED). */
-  osThreadDef(uiTask, StartUiTask, osPriorityNormal, 0, 2048);
+  /* 3072 words: update_rows nests update_detail (a ~2.8 KB snapshot array
+   * each) before render_history; 2048 left little margin. */
+  osThreadDef(uiTask, StartUiTask, osPriorityNormal, 0, 3072);
   osThreadId ui_task = osThreadCreate(osThread(uiTask), NULL);
 
-  /* 2048 words: handle_client (request[1536]) nests append_symbols_page
-   * (form[2300] + row buffers) ~4.1 KB of stack buffers; 1024 overflowed. */
-  osThreadDef(webTask, StartWebTask, osPriorityBelowNormal, 0, 2048);
+  /* 4096 words: handle_client (request[1536]) nests append_symbols_page
+   * (form[2300] + row buffers) ~4.1 KB of stack buffers, and the POST
+   * handlers run settings_save -> flash_save (FatFs FIL + flash HAL +
+   * printf frames); 2048 overflowed once flash persistence landed. */
+  osThreadDef(webTask, StartWebTask, osPriorityBelowNormal, 0, 4096);
   osThreadId web_task = osThreadCreate(osThread(webTask), NULL);
 
   /* TLS handshakes use a deep call stack on Cortex-M7. */
