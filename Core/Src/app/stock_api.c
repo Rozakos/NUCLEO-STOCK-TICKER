@@ -551,22 +551,43 @@ void stock_api_init(void)
 static void parse_extended_hours(const cJSON *quote,
                                  stock_snapshot_t *snapshot)
 {
+  const cJSON *state = cJSON_GetObjectItemCaseSensitive(quote, "market_state");
+  if (cJSON_IsString(state))
+  {
+    if (strcmp(state->valuestring, "PRE") == 0)
+      snapshot->session = STOCK_SESSION_PRE;
+    else if (strcmp(state->valuestring, "REGULAR") == 0)
+      snapshot->session = STOCK_SESSION_REGULAR;
+    else if (strcmp(state->valuestring, "POST") == 0)
+      snapshot->session = STOCK_SESSION_POST;
+    else if (strcmp(state->valuestring, "CLOSED") == 0)
+      snapshot->session = STOCK_SESSION_CLOSED;
+  }
+
   const cJSON *price = cJSON_GetObjectItemCaseSensitive(quote, "pre_market");
   const cJSON *pct =
       cJSON_GetObjectItemCaseSensitive(quote, "pre_market_change_pct");
-  stock_ext_state_t state = STOCK_EXT_PRE;
+  stock_ext_state_t ext = STOCK_EXT_PRE;
   if (!cJSON_IsNumber(price))
   {
     price = cJSON_GetObjectItemCaseSensitive(quote, "post_market");
     pct = cJSON_GetObjectItemCaseSensitive(quote, "post_market_change_pct");
-    state = STOCK_EXT_POST;
+    ext = STOCK_EXT_POST;
   }
   if (!cJSON_IsNumber(price))
   {
     return;
   }
 
-  snapshot->ext_state = state;
+  /* Older API without market_state: infer the session from which
+   * extended field carried a value. */
+  if (snapshot->session == STOCK_SESSION_UNKNOWN)
+  {
+    snapshot->session = ext == STOCK_EXT_PRE ? STOCK_SESSION_PRE
+                                             : STOCK_SESSION_POST;
+  }
+
+  snapshot->ext_state = ext;
   snapshot->ext_price = (float)price->valuedouble;
   if (cJSON_IsNumber(pct))
   {

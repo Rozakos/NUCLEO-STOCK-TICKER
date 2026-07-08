@@ -16,6 +16,17 @@ typedef enum
   STOCK_EXT_POST,       /* after-hours quote active */
 } stock_ext_state_t;
 
+/* The API's market_state field; UNKNOWN when an older API omits it (the
+ * parser then falls back to inferring PRE/POST from the price fields). */
+typedef enum
+{
+  STOCK_SESSION_UNKNOWN = 0,
+  STOCK_SESSION_PRE,
+  STOCK_SESSION_REGULAR,
+  STOCK_SESSION_POST,
+  STOCK_SESSION_CLOSED,
+} stock_session_t;
+
 typedef struct
 {
   char symbol[12];
@@ -24,6 +35,7 @@ typedef struct
   stock_ext_state_t ext_state;
   float ext_price;      /* extended-hours print; change is vs regular close */
   float ext_change_pct;
+  stock_session_t session;
   float closes[STOCK_SPARKLINE_MAX_POINTS];
   size_t close_count;
   uint32_t updated_ms;

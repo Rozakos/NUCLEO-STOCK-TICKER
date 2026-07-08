@@ -22,14 +22,18 @@ display and **Ethernet** networking (WiFi planned later).
   persistent TLS connection. Adaptive layout: ≤4 symbols one full-width column,
   5–8 two compact columns — never scrolls.
 - **Extended hours (Revolut-style)**: during pre-market / after-hours the rows and
-  detail header show the extended print and its change vs regular close, the status
-  bar retitles to PREMARKET / AFTER HOURS with a crescent moon, and the whole market
-  screen shifts to a purple-tinted night palette.
+  detail header show the extended print and its change vs regular close, and the
+  whole market screen shifts to a purple-tinted night palette.
+- **Session status bar**: the title tracks the API's `market_state` — PREMARKET /
+  MARKET OPEN / AFTER HOURS / MARKET CLOSED — with an amber sun while open and a
+  crescent moon otherwise. The right side shows the portfolio total with day P/L
+  (`$12,345 ▲ 1.23%`, green/red, extended-hours aware) and flips to an amber
+  `stale Ns` warning if quote refreshes stop landing.
 - **Detail screen** per symbol: smoothed gradient chart with price/date ticks,
   1D/1W/1M/6M/1Y/5Y/Max ranges, progressive 1D session chart, silent auto-refresh
   each interval. 1D change/color is anchored to the previous close (not the open).
-- **Web admin** at `http://<board-ip>/`: add/delete symbols, shares owned
-  (portfolio total on the status bar), refresh interval.
+- **Web admin** at `http://<board-ip>/`: add/delete symbols, shares owned,
+  refresh interval.
 - **Persistent settings**: saved to a microSD card (`ticker.cfg`) when present,
   otherwise to **internal flash sector 7** (0x080C0000) — watchlist, shares and
   refresh interval survive power cycles with no SD card. Note: a flash save stalls

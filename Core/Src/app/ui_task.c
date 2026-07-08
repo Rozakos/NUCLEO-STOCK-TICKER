@@ -87,9 +87,10 @@ static lv_obj_t *wifi_label;   /* dimmed placeholder until WiFi lands */
 static lv_obj_t *updated_label;
 static lv_obj_t *status_bar;
 static lv_obj_t *title_label;
-static lv_obj_t *moon_icon;    /* crescent = amber disc + bar-colored mask */
+static lv_obj_t *moon_icon;    /* crescent = amber disc + bar-colored mask;
+                                * mask hidden = full disc = sun (market open) */
 static lv_obj_t *moon_mask;
-static stock_ext_state_t market_ext_state;   /* drives the night palette */
+static stock_session_t market_session;   /* drives title + night palette */
 static lv_obj_t *net_info_panel;   /* modal connection-info popup */
 
 /* Regular-session palette vs the purple-tinted "night" palette shown
@@ -103,16 +104,21 @@ static lv_obj_t *net_info_panel;   /* modal connection-info popup */
 #define NIGHT_ROW_BG      0x1C1836
 #define NIGHT_ROW_PRESSED 0x2B2452
 
+static bool theme_night(void)
+{
+  return market_session == STOCK_SESSION_PRE ||
+         market_session == STOCK_SESSION_POST ||
+         market_session == STOCK_SESSION_CLOSED;
+}
+
 static lv_color_t row_bg(void)
 {
-  return lv_color_hex(market_ext_state != STOCK_EXT_NONE ? NIGHT_ROW_BG
-                                                         : DAY_ROW_BG);
+  return lv_color_hex(theme_night() ? NIGHT_ROW_BG : DAY_ROW_BG);
 }
 
 static lv_color_t row_bg_pressed(void)
 {
-  return lv_color_hex(market_ext_state != STOCK_EXT_NONE ? NIGHT_ROW_PRESSED
-                                                         : DAY_ROW_PRESSED);
+  return lv_color_hex(theme_night() ? NIGHT_ROW_PRESSED : DAY_ROW_PRESSED);
 }
 static lv_obj_t *market_screen;
 static lv_obj_t *detail_screen;
@@ -528,14 +534,14 @@ static void update_spark(market_row_t *market, const stock_snapshot_t *snapshot,
   lv_obj_set_style_line_color(market->spark, color, 0);
 }
 
-/* Swap the market screen between the day palette and the extended-hours
- * night palette, retitle the status bar and show/hide the crescent moon.
- * No-op when the session state hasn't changed. */
-static void apply_market_theme(stock_ext_state_t state)
+/* Swap the market screen between the day palette and the night palette,
+ * retitle the status bar for the session and show the sun (open) or
+ * crescent moon (pre/post/closed). No-op when the session hasn't changed. */
+static void apply_market_theme(stock_session_t session)
 {
-  if (state == market_ext_state) return;
-  market_ext_state = state;
-  bool night = state != STOCK_EXT_NONE;
+  if (session == market_session) return;
+  market_session = session;
+  bool night = theme_night();
 
   lv_color_t screen_bg = lv_color_hex(night ? NIGHT_SCREEN_BG : DAY_SCREEN_BG);
   lv_color_t bar_bg = lv_color_hex(night ? NIGHT_BAR_BG : DAY_BAR_BG);
@@ -549,22 +555,34 @@ static void apply_market_theme(stock_ext_state_t state)
                               LV_STATE_PRESSED);
   }
 
-  lv_label_set_text(title_label, state == STOCK_EXT_PRE    ? "PREMARKET"
-                                 : state == STOCK_EXT_POST ? "AFTER HOURS"
-                                                           : "MARKETS");
+  const char *title =
+      session == STOCK_SESSION_PRE     ? "PREMARKET"
+      : session == STOCK_SESSION_REGULAR ? "MARKET OPEN"
+      : session == STOCK_SESSION_POST  ? "AFTER HOURS"
+      : session == STOCK_SESSION_CLOSED ? "MARKET CLOSED"
+                                        : "MARKETS";
+  lv_label_set_text(title_label, title);
+  printf("[ui] session: %s\r\n", title);
+
+  if (session == STOCK_SESSION_UNKNOWN)
+  {
+    lv_obj_add_flag(moon_icon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(moon_mask, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  /* Amber disc next to the title; at night the bar-colored mask carves it
+   * into a crescent, in the open session the bare disc reads as a sun. */
+  lv_obj_clear_flag(moon_icon, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_update_layout(status_bar);
+  lv_obj_align_to(moon_icon, title_label, LV_ALIGN_OUT_LEFT_MID, -8, 0);
   if (night)
   {
-    /* The mask disc matches the bar so the amber disc reads as a crescent. */
     lv_obj_set_style_bg_color(moon_mask, bar_bg, 0);
-    lv_obj_clear_flag(moon_icon, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(moon_mask, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_update_layout(status_bar);
-    lv_obj_align_to(moon_icon, title_label, LV_ALIGN_OUT_LEFT_MID, -8, 0);
     lv_obj_align_to(moon_mask, moon_icon, LV_ALIGN_CENTER, 4, -3);
   }
   else
   {
-    lv_obj_add_flag(moon_icon, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(moon_mask, LV_OBJ_FLAG_HIDDEN);
   }
 }
@@ -576,16 +594,20 @@ static void update_rows(void)
   float shares[APP_MAX_SYMBOLS];
   settings_get_shares(shares);
   float portfolio_total = 0.0f;
+  float portfolio_prev = 0.0f;   /* holdings valued at previous close */
   bool portfolio_any = false;
 
-  /* Session state comes from whichever symbol reported extended data;
-   * the watchlist is US equities, so one symbol speaks for all. */
-  stock_ext_state_t session = STOCK_EXT_NONE;
+  /* Session comes from the first symbol that reported one; the watchlist
+   * is US equities, so one symbol speaks for all. */
+  stock_session_t session = STOCK_SESSION_UNKNOWN;
   for (size_t i = 0; i < stock_count; ++i)
   {
-    if (!stocks[i].fresh || stocks[i].ext_state == STOCK_EXT_NONE) continue;
-    session = stocks[i].ext_state;
-    if (session == STOCK_EXT_PRE) break;
+    if (!stocks[i].fresh || stocks[i].session == STOCK_SESSION_UNKNOWN)
+    {
+      continue;
+    }
+    session = stocks[i].session;
+    break;
   }
   apply_market_theme(session);
 
@@ -632,6 +654,12 @@ static void update_rows(void)
     if (shares[row] > 0.0f)
     {
       portfolio_total += shares[row] * shown_price;
+      /* Previous close backed out of the regular-session quote; the day
+       * P/L then naturally includes any extended-hours move. */
+      float prev_close = snapshot->change_pct > -100.0f
+          ? snapshot->last / (1.0f + snapshot->change_pct / 100.0f)
+          : snapshot->last;
+      portfolio_prev += shares[row] * prev_close;
       portfolio_any = true;
     }
 
@@ -661,20 +689,50 @@ static void update_rows(void)
                               link_color, 0);
   }
 
-  char updated[40];
-  if (portfolio_any)
+  /* Right side of the bar: portfolio total + day P/L. When refreshes stop
+   * landing (2 intervals + slack) an amber stale warning takes the slot;
+   * before the first quote the label keeps its "starting..." text. */
+  uint32_t newest_ms = 0;
+  bool any_fresh = false;
+  for (size_t i = 0; i < stock_count; ++i)
   {
-    /* Whole dollars keep the status bar narrow even for large totals. */
-    snprintf(updated, sizeof(updated), "$%lu | %lus",
-             (unsigned long)(portfolio_total + 0.5f),
-             (unsigned long)(HAL_GetTick() / 1000U));
+    if (!stocks[i].fresh) continue;
+    any_fresh = true;
+    if (stocks[i].updated_ms > newest_ms) newest_ms = stocks[i].updated_ms;
   }
-  else
+  if (any_fresh)
   {
-    snprintf(updated, sizeof(updated), "updated %lus",
-             (unsigned long)(HAL_GetTick() / 1000U));
+    char updated[40];
+    uint32_t age = HAL_GetTick() - newest_ms;
+    if (age > settings_get_refresh_seconds() * 2000U + 5000U)
+    {
+      snprintf(updated, sizeof(updated), "stale %lus",
+               (unsigned long)(age / 1000U));
+      lv_label_set_text(updated_label, updated);
+      lv_obj_set_style_text_color(updated_label, lv_color_hex(0xFBBF24), 0);
+    }
+    else if (portfolio_any && portfolio_prev > 0.0f)
+    {
+      float day_pl = (portfolio_total - portfolio_prev) / portfolio_prev
+                     * 100.0f;
+      char pct[16];
+      format_decimal_2(pct, sizeof(pct), day_pl >= 0.0f ? day_pl : -day_pl,
+                       0);
+      /* Whole dollars keep the status bar narrow even for large totals. */
+      snprintf(updated, sizeof(updated), "$%lu %s%s%%",
+               (unsigned long)(portfolio_total + 0.5f),
+               day_pl >= 0.0f ? LV_SYMBOL_UP : LV_SYMBOL_DOWN, pct);
+      lv_label_set_text(updated_label, updated);
+      lv_obj_set_style_text_color(updated_label,
+                                  day_pl >= 0.0f ? lv_color_hex(0x4ADE80)
+                                                 : lv_color_hex(0xF87171),
+                                  0);
+    }
+    else
+    {
+      lv_label_set_text(updated_label, "");
+    }
   }
-  lv_label_set_text(updated_label, updated);
   update_detail();
 }
 

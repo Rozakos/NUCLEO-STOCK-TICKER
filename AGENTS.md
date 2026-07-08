@@ -90,6 +90,13 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
       portfolio total follow the extended print, the status bar shows PREMARKET/AFTER HOURS
       with a drawn crescent moon, and the market screen switches to a purple night palette
       (`apply_market_theme` in ui_task.c). Verified live during after-hours.
+      Extended same day: the title is now driven by the API's `market_state` (snapshot
+      `session` field) through all four states — PREMARKET / MARKET OPEN (amber sun =
+      bare disc, day palette) / AFTER HOURS / MARKET CLOSED (moon, night palette) —
+      and the right status-bar slot shows portfolio total + day P/L vs prev close
+      (green/red, ext-aware) instead of the old uptime counter, with an amber
+      "stale Ns" takeover when no refresh lands for 2 intervals + 5 s.
+      Verified live during the open session (`[ui] session: MARKET OPEN`).
 - [x] **Settings persistence without SD (2026-07-08)**: flash sector 7 blob
       (`0x080C0000`, magic+checksum, skip-if-unchanged) as fallback when SD is absent;
       linker FLASH capped at 768K to reserve the sector. Verified end-to-end on target
@@ -164,6 +171,20 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 - Many Disco peripherals are enabled but unused (DCMI/SAI/SPDIF/QSPI/USB host) — ignore them.
 
 ## 8. Session log
+
+- **2026-07-08 (later) — Claude (Fable 5, Claude Code):** Status bar made useful. The
+  center title was a static "MARKETS" leftover; now `parse_extended_hours()` also reads
+  the API's `market_state` string into a new `stock_session_t session` snapshot field
+  (fallback: infer PRE/POST from the extended price fields for older API deploys) and
+  `apply_market_theme()` keys off it: PREMARKET / MARKET OPEN / AFTER HOURS / MARKET
+  CLOSED, amber sun disc while open (the crescent's mask hidden = full disc), moon +
+  night palette for everything else (CLOSED is now night too — was day "MARKETS").
+  The right slot's "updated Ns" was **uptime**, not update age — replaced with
+  portfolio total + day P/L (`$12345 ▲ 1.23%`, holdings at ext-aware price vs prev
+  close backed out of `last/(1+change_pct/100)`), green/red; empty without shares;
+  amber `stale Ns` takeover when the newest snapshot is older than 2 refresh intervals
+  + 5 s. Verified on target mid-session: `[ui] session: MARKET OPEN`, and the user's
+  web-UI watchlist survived the reflash via the sector-7 store.
 
 - **2026-07-08 — Claude (Fable 5, Claude Code):** Extended-hours support + three fixes,
   all verified on target during live after-hours. (1) **Pre/after-market quotes**:
