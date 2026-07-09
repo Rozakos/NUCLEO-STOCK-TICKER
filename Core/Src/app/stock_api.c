@@ -749,10 +749,14 @@ int stock_api_fetch_history(const history_request_t *request,
                             history_snapshot_t *snapshot,
                             char *error, size_t error_size)
 {
+  /* 1d asks for the extended-hours window (prepost=1): points cover
+   * 04:00-20:00 ET and the response adds window_open/window_close and
+   * prev_close. The server ignores the flag for crypto and other ranges. */
+  bool intraday = strcmp(request->range, "1d") == 0;
   char path[128];
-  snprintf(path, sizeof(path), "%s/history/%s?range=%s&limit=%u",
+  snprintf(path, sizeof(path), "%s/history/%s?range=%s&limit=%u%s",
            STOCK_API_BASE_PATH, request->symbol, request->range,
-           STOCK_SPARKLINE_MAX_POINTS);
+           STOCK_SPARKLINE_MAX_POINTS, intraday ? "&prepost=1" : "");
 
   char *body;
   if (https_get(path, &body, NULL, error, error_size) != 0)
@@ -794,6 +798,21 @@ int stock_api_fetch_history(const history_request_t *request,
   if (cJSON_IsNumber(session_close))
   {
     snapshot->session_close = (uint32_t)session_close->valuedouble;
+  }
+  cJSON *window_open = cJSON_GetObjectItemCaseSensitive(root, "window_open");
+  if (cJSON_IsNumber(window_open))
+  {
+    snapshot->window_open = (uint32_t)window_open->valuedouble;
+  }
+  cJSON *window_close = cJSON_GetObjectItemCaseSensitive(root, "window_close");
+  if (cJSON_IsNumber(window_close))
+  {
+    snapshot->window_close = (uint32_t)window_close->valuedouble;
+  }
+  cJSON *prev_close = cJSON_GetObjectItemCaseSensitive(root, "prev_close");
+  if (cJSON_IsNumber(prev_close))
+  {
+    snapshot->prev_close = (float)prev_close->valuedouble;
   }
 
   cJSON *point;

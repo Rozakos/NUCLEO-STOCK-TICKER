@@ -155,6 +155,26 @@ static int detail_fill_n;
 static int32_t detail_fill_x[DETAIL_CR_MAX_OUT];
 static int32_t detail_fill_y[DETAIL_CR_MAX_OUT];
 static int32_t detail_fill_bottom;
+/* Market open/close divider x positions inside the extended-hours 1D
+ * window (chart-local px); 0 dividers outside prepost mode. */
+static int detail_divider_n;
+static int32_t detail_divider_x[2];
+
+/* 1D session views, picked from a dropdown opened by re-tapping the
+ * active 1D button. FULL is the whole extended window with the open/
+ * close dividers; the others zoom to one segment. A segment is offered
+ * only once it has data, so during pre-market the dropdown stays shut. */
+typedef enum
+{
+  DAY_VIEW_FULL = 0,
+  DAY_VIEW_PRE,
+  DAY_VIEW_MARKET,
+  DAY_VIEW_POST,
+} day_view_t;
+static day_view_t detail_day_view;
+static bool detail_day_market_ok;   /* regular session has data */
+static bool detail_day_post_ok;     /* after-hours has data */
+static lv_obj_t *detail_day_menu;   /* full-screen backdrop; NULL = closed */
 
 /* Button label i shows range_labels[i]; the API gets range_api[i]. */
 static const char *range_labels[DETAIL_NUM_RANGES] = {
@@ -175,6 +195,7 @@ static const float y_steps[] = {
 static void update_detail(void);
 static void create_detail_screen(const char *symbol);
 static void spark_area_fill(lv_event_t *event);
+static void render_history(const history_snapshot_t *history);
 
 static void row_clicked(lv_event_t *event)
 {
@@ -196,6 +217,7 @@ static void back_clicked(lv_event_t *event)
   detail_spinner = NULL;
   detail_error_label = NULL;
   detail_marker = NULL;
+  detail_day_menu = NULL;   /* died with the screen */
   memset(detail_range_buttons, 0, sizeof(detail_range_buttons));
 }
 
@@ -228,6 +250,7 @@ static void start_history_fetch(void)
   detail_window_rendered = false;
   lv_chart_set_all_values(detail_chart, detail_series, LV_CHART_POINT_NONE);
   detail_fill_n = 0;
+  detail_divider_n = 0;
   lv_obj_add_flag(detail_marker, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(detail_error_label, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(detail_spinner, LV_OBJ_FLAG_HIDDEN);
@@ -241,6 +264,96 @@ static void start_history_fetch(void)
          range_api[detail_range_pending]);
 }
 
+static void day_menu_close(void)
+{
+  if (detail_day_menu != NULL)
+  {
+    /* Async: close runs from the menu's own event callbacks. */
+    lv_obj_delete_async(detail_day_menu);
+    detail_day_menu = NULL;
+  }
+}
+
+static void day_menu_backdrop_clicked(lv_event_t *event)
+{
+  (void)event;
+  day_menu_close();
+}
+
+static void day_view_selected(lv_event_t *event)
+{
+  day_view_t view = (day_view_t)(uintptr_t)lv_event_get_user_data(event);
+  day_menu_close();
+  if (view == detail_day_view) return;
+  detail_day_view = view;
+
+  /* Re-render the already-fetched 1d snapshot; no network round-trip. */
+  history_snapshot_t history;
+  if (history_data_get(&history) && history.fresh && !history.error &&
+      strcmp(history.symbol, detail_symbol) == 0 &&
+      strcmp(history.range, "1d") == 0)
+  {
+    render_history(&history);
+  }
+}
+
+/* Session-view dropdown under the 1D button. Modal: a full-screen
+ * transparent backdrop eats stray taps and closes the menu. */
+static void open_day_menu(void)
+{
+  /* Nothing to choose before the regular session has data — during
+   * pre-market the full window IS the pre-market view. */
+  if (detail_day_menu != NULL || !detail_day_market_ok) return;
+
+  static const char *view_names[] = {
+    "Full day", "Pre-market", "Live market", "After hours"
+  };
+  int view_count = detail_day_post_ok ? 4 : 3;
+
+  detail_day_menu = lv_obj_create(detail_screen);
+  lv_obj_remove_style_all(detail_day_menu);
+  lv_obj_set_size(detail_day_menu, LCD_WIDTH, LCD_HEIGHT);
+  lv_obj_align(detail_day_menu, LV_ALIGN_TOP_LEFT, -DETAIL_PAD, -DETAIL_PAD);
+  lv_obj_add_flag(detail_day_menu, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(detail_day_menu, day_menu_backdrop_clicked,
+                      LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *panel = lv_obj_create(detail_day_menu);
+  lv_obj_set_size(panel, 150, view_count * 30 + 14);
+  lv_obj_set_pos(panel, DETAIL_PAD,
+                 DETAIL_PAD + DETAIL_HEADER_H + 2 + DETAIL_BTN_ROW_H + 2);
+  lv_obj_set_style_bg_color(panel, lv_color_hex(0x1B2534), 0);
+  lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(panel, lv_color_hex(0x263244), 0);
+  lv_obj_set_style_border_width(panel, 1, 0);
+  lv_obj_set_style_radius(panel, 8, 0);
+  lv_obj_set_style_pad_all(panel, 6, 0);
+  lv_obj_set_style_pad_row(panel, 2, 0);
+  lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+  lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+  for (int v = 0; v < view_count; ++v)
+  {
+    lv_obj_t *button = lv_button_create(panel);
+    lv_obj_remove_style_all(button);
+    lv_obj_set_size(button, LV_PCT(100), 28);
+    lv_obj_set_style_radius(button, 5, 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_font(button, &lv_font_montserrat_14, 0);
+    bool current = v == (int)detail_day_view;
+    lv_obj_set_style_bg_color(button, current ? detail_line_color
+                                              : lv_color_hex(0x1B2534), 0);
+    lv_obj_add_event_cb(button, day_view_selected, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)v);
+
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, view_names[v]);
+    lv_obj_set_style_text_color(label, current ? lv_color_hex(0x0B0F17)
+                                               : lv_color_hex(0xE7EEF7), 0);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 8, 0);
+  }
+}
+
 static void range_clicked(lv_event_t *event)
 {
   int index = (int)(uintptr_t)lv_event_get_user_data(event);
@@ -250,6 +363,11 @@ static void range_clicked(lv_event_t *event)
   if (index == detail_range_displayed &&
       lv_obj_has_flag(detail_error_label, LV_OBJ_FLAG_HIDDEN))
   {
+    /* Re-tapping the active 1D opens the session-view dropdown. */
+    if (index == 0 && detail_window_rendered)
+    {
+      open_day_menu();
+    }
     return;
   }
   detail_range_pending = index;
@@ -750,6 +868,20 @@ static void chart_area_fill(lv_event_t *event)
                                 detail_fill_n, coords.x1, coords.y1,
                                 detail_fill_bottom, detail_line_color,
                                 LV_OPA_70);
+
+  /* Faint verticals at market open/close inside the extended-hours window. */
+  lv_draw_rect_dsc_t divider_dsc;
+  lv_draw_rect_dsc_init(&divider_dsc);
+  divider_dsc.bg_color = lv_color_hex(0x64748B);
+  divider_dsc.bg_opa = LV_OPA_40;
+  divider_dsc.border_width = 0;
+  for (int i = 0; i < detail_divider_n; ++i)
+  {
+    lv_area_t r = { coords.x1 + detail_divider_x[i], coords.y1,
+                    coords.x1 + detail_divider_x[i],
+                    coords.y1 + detail_fill_bottom - 1 };
+    lv_draw_rect(layer, &divider_dsc, &r);
+  }
 }
 
 static float pick_y_step(float range)
@@ -767,7 +899,55 @@ static void render_history(const history_snapshot_t *history)
 {
   size_t n = history->point_count;
   const float *closes = history->closes;
+  const uint32_t *stamps = history->timestamps;
   if (n < 2U) return;
+
+  bool progressive = strcmp(history->range, "1d") == 0;
+
+  /* 1D session views: FULL keeps the whole extended window; the others
+   * trim the points and axis to one segment. Availability follows the
+   * data, and the view falls back to FULL when the bounds are missing
+   * (older API, crypto) or the chosen segment has under two points. */
+  uint32_t view_open = 0, view_close = 0;
+  if (progressive)
+  {
+    uint32_t w_open = history->window_open, w_close = history->window_close;
+    uint32_t s_open = history->session_open, s_close = history->session_close;
+    uint32_t newest = stamps[n - 1U];
+    bool have_bounds = s_open != 0U && s_close > s_open &&
+                       w_open != 0U && w_close > w_open;
+    detail_day_market_ok = have_bounds && newest >= s_open;
+    detail_day_post_ok = have_bounds && newest > s_close;
+    if (!detail_day_market_ok ||
+        (detail_day_view == DAY_VIEW_POST && !detail_day_post_ok))
+    {
+      detail_day_view = DAY_VIEW_FULL;
+    }
+    if (detail_day_view != DAY_VIEW_FULL)
+    {
+      view_open = detail_day_view == DAY_VIEW_PRE      ? w_open
+                  : detail_day_view == DAY_VIEW_MARKET ? s_open
+                                                       : s_close;
+      view_close = detail_day_view == DAY_VIEW_PRE      ? s_open
+                   : detail_day_view == DAY_VIEW_MARKET ? s_close
+                                                        : w_close;
+      size_t i0 = 0, i1 = n;
+      while (i0 < n && stamps[i0] < view_open) ++i0;
+      while (i1 > i0 && stamps[i1 - 1U] > view_close) --i1;
+      if (i1 - i0 >= 2U)
+      {
+        closes += i0;
+        stamps += i0;
+        n = i1 - i0;
+      }
+      else
+      {
+        detail_day_view = DAY_VIEW_FULL;
+        view_open = 0;
+        view_close = 0;
+      }
+    }
+  }
 
   lv_obj_add_flag(detail_spinner, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(detail_error_label, LV_OBJ_FLAG_HIDDEN);
@@ -854,31 +1034,47 @@ static void render_history(const history_snapshot_t *history)
   float span = hi_snap - lo_snap;
   if (span <= 0.0f) span = 1.0f;
 
-  /* Progressive 1D: the X axis spans the WHOLE trading session and the
-   * line fills only the elapsed part (Revolut-style). Other ranges fill
-   * the full width. */
-  bool progressive = strcmp(history->range, "1d") == 0;
+  /* Progressive 1D: the X axis spans the WHOLE trading day and the line
+   * fills only the elapsed part (Revolut-style). With prepost=1 the API
+   * hands back window_open/window_close (04:00-20:00 ET) as the axis and
+   * keeps session_open/close at the regular bounds for the dividers;
+   * a segment view narrows the axis to its own bounds, and older
+   * responses fall back to the regular session as the axis. Other
+   * ranges fill the full width. */
   static float slot_value[DETAIL_CR_MAX_OUT];
   int total_slots, active_n;
-  uint32_t session_open = 0, session_close = 0;
+  uint32_t axis_open = 0, axis_close = 0;
   if (progressive)
   {
-    session_open = history->session_open;
-    session_close = history->session_close;
-    uint32_t first_ts = history->timestamps[0];
-    uint32_t last_ts = history->timestamps[n - 1U];
-    if (session_open == 0U || session_close <= session_open)
+    if (view_open != 0U)
     {
-      /* API omitted session bounds: assume a 6.5 h regular US session
+      axis_open = view_open;
+      axis_close = view_close;
+    }
+    else
+    {
+      axis_open = history->window_open;
+      axis_close = history->window_close;
+    }
+    if (axis_open == 0U || axis_close <= axis_open)
+    {
+      axis_open = history->session_open;
+      axis_close = history->session_close;
+    }
+    uint32_t first_ts = stamps[0];
+    uint32_t last_ts = stamps[n - 1U];
+    if (axis_open == 0U || axis_close <= axis_open)
+    {
+      /* API omitted all bounds: assume a 6.5 h regular US session
        * starting at the first data point. */
-      session_open = first_ts != 0U ? first_ts : last_ts;
-      session_close = session_open + 23400U;
+      axis_open = first_ts != 0U ? first_ts : last_ts;
+      axis_close = axis_open + 23400U;
     }
     float fraction = 1.0f;
-    if (session_close > session_open && last_ts > 0U)
+    if (axis_close > axis_open && last_ts > 0U)
     {
-      fraction = (float)(last_ts - session_open) /
-                 (float)(session_close - session_open);
+      fraction = (float)(last_ts - axis_open) /
+                 (float)(axis_close - axis_open);
     }
     if (fraction < 0.02f) fraction = 0.02f;   /* always show a sliver */
     if (fraction > 1.0f) fraction = 1.0f;
@@ -928,22 +1124,43 @@ static void render_history(const history_snapshot_t *history)
     detail_fill_y[i] = y;
   }
 
+  /* Market open/close dividers, only when the axis is the wider extended
+   * window (a divider at the very edge of a session-only axis is noise). */
+  detail_divider_n = 0;
+  if (progressive && axis_close > axis_open)
+  {
+    uint32_t bounds[2] = { history->session_open, history->session_close };
+    for (int i = 0; i < 2; ++i)
+    {
+      if (bounds[i] > axis_open && bounds[i] < axis_close)
+      {
+        detail_divider_x[detail_divider_n++] =
+            (int32_t)(((uint64_t)plot_w * (bounds[i] - axis_open)) /
+                      (axis_close - axis_open));
+      }
+    }
+  }
+
   lv_chart_refresh(detail_chart);
 
   /* Header reflects the displayed window: last close + window % change.
    * 1D is the exception: like the list rows it compares against the
-   * previous session close (derived from the live quote, which the
-   * history feed doesn't carry), so a gap-down day that climbs off the
-   * open still reads red. */
+   * previous session close (the prepost history response carries it as
+   * prev_close; older responses fall back to deriving it from the live
+   * quote), so a gap-down day that climbs off the open still reads red. */
   stock_snapshot_t live;
   bool have_live = stock_data_get_symbol(history->symbol, &live) &&
                    live.fresh;
   float first = closes[0];
   float last = closes[n - 1U];
   float change = first != 0.0f ? (last - first) / first * 100.0f : 0.0f;
-  if (progressive && have_live && live.change_pct > -100.0f)
+  if (progressive)
   {
-    float prev_close = live.last / (1.0f + live.change_pct / 100.0f);
+    float prev_close = history->prev_close;
+    if (prev_close <= 0.0f && have_live && live.change_pct > -100.0f)
+    {
+      prev_close = live.last / (1.0f + live.change_pct / 100.0f);
+    }
     if (prev_close > 0.0f)
     {
       change = (last - prev_close) / prev_close * 100.0f;
@@ -976,19 +1193,38 @@ static void render_history(const history_snapshot_t *history)
   lv_chart_set_series_color(detail_chart, detail_series, accent);
 
   /* X-axis labels reflect the requested range, not the API interval.
-   * 1d -> fixed session ticks (open..close clock times) so the axis covers
-   * the whole day regardless of elapsed time; other ranges sample dates
-   * from the points, last tick anchored to the newest point. */
+   * 1d -> clock-time ticks across the axis window so the axis covers the
+   * whole day regardless of elapsed time; on the extended-hours window
+   * the two middle ticks snap to market open/close (the divider lines),
+   * so they read the real session times instead of arbitrary evenly
+   * spaced ones. Other ranges sample dates from the points, last tick
+   * anchored to the newest point. */
+  int32_t tick_x[DETAIL_X_TICKS];
+  for (int k = 0; k < DETAIL_X_TICKS; ++k)
+  {
+    tick_x[k] = (plot_w * k) / (DETAIL_X_TICKS - 1);
+  }
   if (progressive)
   {
-    uint32_t session_span = session_close - session_open;
+    uint32_t axis_span = axis_close - axis_open;
+    uint32_t tick_t[DETAIL_X_TICKS];
     for (int k = 0; k < DETAIL_X_TICKS; ++k)
     {
-      uint32_t t = session_open +
-          (uint32_t)(((uint64_t)session_span * (uint32_t)k) /
+      tick_t[k] = axis_open +
+          (uint32_t)(((uint64_t)axis_span * (uint32_t)k) /
                      (uint32_t)(DETAIL_X_TICKS - 1));
+    }
+    if (detail_divider_n == 2 && DETAIL_X_TICKS == 4)
+    {
+      tick_t[1] = history->session_open;
+      tick_x[1] = detail_divider_x[0];
+      tick_t[2] = history->session_close;
+      tick_x[2] = detail_divider_x[1];
+    }
+    for (int k = 0; k < DETAIL_X_TICKS; ++k)
+    {
       chart_civil_t civil;
-      chart_util_epoch_to_civil(t, APP_UTC_OFFSET_MINUTES, &civil);
+      chart_util_epoch_to_civil(tick_t[k], APP_UTC_OFFSET_MINUTES, &civil);
       snprintf(text, sizeof(text), "%02d:%02d", civil.hour, civil.minute);
       lv_label_set_text(detail_x_labels[k], text);
     }
@@ -998,16 +1234,14 @@ static void render_history(const history_snapshot_t *history)
     /* Pick the date format from the window's wall-time span: years-wide
      * windows label years, medium ones month+year, short ones day+month. */
     long span_days = 0;
-    if (history->timestamps[0] > 0U &&
-        history->timestamps[n - 1U] > history->timestamps[0])
+    if (stamps[0] > 0U && stamps[n - 1U] > stamps[0])
     {
-      span_days = (long)((history->timestamps[n - 1U] -
-                          history->timestamps[0]) / 86400U);
+      span_days = (long)((stamps[n - 1U] - stamps[0]) / 86400U);
     }
     for (int k = 0; k < DETAIL_X_TICKS; ++k)
     {
       size_t index = ((n - 1U) * (size_t)k) / (size_t)(DETAIL_X_TICKS - 1);
-      uint32_t t = history->timestamps[index];
+      uint32_t t = stamps[index];
       if (t == 0U)
       {
         lv_label_set_text(detail_x_labels[k], "");
@@ -1036,7 +1270,7 @@ static void render_history(const history_snapshot_t *history)
   for (int k = 0; k < DETAIL_X_TICKS; ++k)
   {
     lv_obj_t *label = detail_x_labels[k];
-    int x_px = gutter + (plot_w * k) / (DETAIL_X_TICKS - 1);
+    int x_px = gutter + tick_x[k];
     lv_obj_update_layout(label);
     int lw = lv_obj_get_width(label);
     int lh = lv_obj_get_height(label);
@@ -1397,6 +1631,10 @@ static void create_detail_screen(const char *symbol)
   detail_range_displayed = 0;
   detail_range_pending = 0;
   detail_fill_n = 0;
+  detail_divider_n = 0;
+  detail_day_view = DAY_VIEW_FULL;
+  detail_day_market_ok = false;
+  detail_day_post_ok = false;
   detail_line_color = lv_color_hex(0x4ADE80);
 
   detail_screen = lv_obj_create(NULL);

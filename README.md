@@ -32,6 +32,12 @@ display and **Ethernet** networking (WiFi planned later).
 - **Detail screen** per symbol: smoothed gradient chart with price/date ticks,
   1D/1W/1M/6M/1Y/5Y/Max ranges, progressive 1D session chart, silent auto-refresh
   each interval. 1D change/color is anchored to the previous close (not the open).
+- **Extended-hours 1D chart** (API `prepost=1`): the 1D axis spans the full
+  04:00–20:00 ET window with faint divider lines at the regular open/close, and the
+  middle time ticks snap to those dividers. Re-tapping the active 1D button opens a
+  session-view dropdown — Full day / Pre-market / Live market / After hours — that
+  only offers segments which already have data (inert during pre-market); segment
+  views re-render from the fetched snapshot with no extra request.
 - **Web admin** at `http://<board-ip>/`: add/delete symbols, shares owned,
   refresh interval.
 - **Persistent settings**: saved to a microSD card (`ticker.cfg`) when present,
@@ -62,7 +68,8 @@ display and **Ethernet** networking (WiFi planned later).
 - [x] **M3** LVGL on LTDC + DMA2D, FT5336 touch, double buffering
 - [x] **M4** UI port: watchlist, sparklines, detail charts, logos, web admin
 - [x] Extended-hours quotes + night theme, settings persistence (SD or flash)
-- [ ] 1D chart pre/post-market segments (blocked on API `prepost` history support)
+- [x] 1D extended-hours chart (`prepost=1`): full-window axis, open/close dividers,
+      session-view dropdown on the 1D button
 - [ ] WiFi as alternate netif
 
 ## Hardware notes

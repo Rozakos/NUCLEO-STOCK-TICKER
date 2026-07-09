@@ -29,6 +29,14 @@ typedef struct
    * the UI uses these to draw the progressive intraday chart. */
   uint32_t session_open;
   uint32_t session_close;
+  /* Extended-hours bounds (04:00-20:00 ET) when the 1d request used
+   * prepost=1 (0 otherwise); session_open/close stay the regular session
+   * so the UI can mark market open/close inside the wider window. */
+  uint32_t window_open;
+  uint32_t window_close;
+  /* Previous regular-session close (0 when the API omits it); the 1d
+   * day-change baseline, replacing the derivation from the live quote. */
+  float prev_close;
   size_t point_count;
   uint32_t generation;
   bool fresh;

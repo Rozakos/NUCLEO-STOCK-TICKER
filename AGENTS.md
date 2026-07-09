@@ -26,8 +26,13 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
   Quotes carry extended-hours fields: `market_state` (PRE/REGULAR/POST/CLOSED),
   `pre_market`/`pre_market_change_pct` (non-null only during PRE) and
   `post_market`/`post_market_change_pct` (POST/CLOSED); change % is vs regular close.
-  History is regular-session only (no prepost, no prev_close) as of 2026-07-08 —
-  a `prepost=1` extension has been requested for pre-market 1D charts.
+  History `range=1d` supports `prepost=1` (deployed API-side 2026-07-08): points span
+  the extended 04:00–20:00 ET window and the response adds `window_open`/`window_close`
+  (fixed axis bounds), `market_state` and `prev_close`; `session_open`/`session_close`
+  keep meaning the regular 09:30/16:00 bounds. The flag is ignored for crypto and
+  non-1d ranges, and omitting it returns the old byte-identical response. Crypto
+  (`-USD` suffix, CoinGecko-backed) works with no firmware change — symbol validation
+  already accepts `-`.
 
 ## 2. Hardware / toolchain facts
 
@@ -121,20 +126,27 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
       card is available, else the flash sector-7 blob (this board has no SD card).
 - [x] **TLS verification**: `rozakos.eu` hostname and certificate chain are verified against
       the pinned Google Trust Services WE1 intermediate (valid through 2029-02-20).
+- [x] **Extended-hours 1D chart + session views (2026-07-09)**: 1d history fetched with
+      `prepost=1`; snapshot carries `window_open`/`window_close`/`prev_close`. The
+      progressive 1D axis spans the extended window, faint dividers mark the regular
+      open/close, middle X ticks snap to them, and re-tapping the active 1D button opens
+      a session-view dropdown (Full day / Pre-market / Live market / After hours), gated
+      by which segments have data. Verified on target during pre-market; market/after
+      states pending a live session.
 - [ ] Later: WiFi as alternate netif.
 
 ## 6. NEXT ACTION (start here)
 
-Everything through extended hours + persistence is verified on target (2026-07-08).
+Everything through the extended-hours 1D chart is flashed; pre-market state verified
+on target (2026-07-09).
 
 **DO THIS NEXT:**
-1. **Pre-market 1D chart segments** — blocked on the API. A `prepost=1` extension for
-   `GET /history/{symbol}?range=1d` has been requested (extended-window points +
-   `window_open`/`window_close` + `market_state` + `prev_close`; see the prompt in the
-   2026-07-08 session log context). Once deployed: request with `prepost=1` during
-   PRE/POST, draw points outside `session_open..session_close` in the amber accent
-   (0xFBBF24, matches the moon), divider at the regular open, and use `prev_close`
-   directly instead of deriving it from the live quote in `render_history`.
+1. **Verify the 1D session-view dropdown through a full trading day** — it shipped
+   during pre-market, when the dropdown is intentionally inert. During the live session
+   (16:30–23:00 Greece time) re-tapping the active 1D button should offer Full day /
+   Pre-market / Live market; after close, After hours joins. Optional polish, explicitly
+   NOT done (the dropdown replaced it per user direction): drawing the pre/post segments
+   of the Full-day view in the amber accent (0xFBBF24).
 2. WiFi as an alternate netif (the status bar already reserves a dimmed WiFi icon).
 3. Debugging a hang/crash? See the device-debug workflow: serial on COM4, web-UI POSTs
    via `Invoke-WebRequest -UseBasicParsing`, and hot-attach forensics with
@@ -171,6 +183,27 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 - Many Disco peripherals are enabled but unused (DCMI/SAI/SPDIF/QSPI/USB host) — ignore them.
 
 ## 8. Session log
+
+- **2026-07-09 — Claude (Fable 5, Claude Code):** Adapted to the API's `prepost=1` 1d
+  history (deployed API-side 2026-07-08). `stock_api_fetch_history` appends `prepost=1`
+  for the 1d range and parses `window_open`/`window_close`/`prev_close` into the
+  history snapshot (whole-struct mailbox — no plumbing changes needed). In
+  `render_history`: the progressive 1D axis now prefers the extended window (fallbacks:
+  session bounds, then the 6.5 h heuristic), faint vertical dividers mark the regular
+  open/close (drawn with the gradient in `chart_area_fill`), the two middle X ticks
+  snap to the dividers (user feedback: even spacing put "16:20" beside the 16:30 open
+  and read as wrong), and the 1D day-change baseline prefers the API's `prev_close`
+  over the live-quote derivation. Added the 1D **session-view dropdown** (user request,
+  superseding the planned amber pre/post coloring): re-tapping the active 1D button
+  opens a modal menu — Full day / Pre-market / Live market / After hours — gated by
+  data presence (inert during pre-market; + Live market during the session; all four
+  after the close). Segment views trim points and axis to the segment and re-render
+  from the cached snapshot with no refetch; anything missing bounds (older API, crypto)
+  or with <2 points in the segment falls back to Full day. Menu deletes async (closes
+  from its own event callbacks); state resets with the detail screen. Also confirmed
+  the API's crypto addition needs no firmware change (`valid_symbol_char` already
+  accepts `-`). Verified on target during pre-market: clean boot, PREMARKET session,
+  quotes live, dropdown correctly inert; live/after-hours states await the session.
 
 - **2026-07-08 (later) — Claude (Fable 5, Claude Code):** Status bar made useful. The
   center title was a static "MARKETS" leftover; now `parse_extended_hours()` also reads
