@@ -3,17 +3,13 @@
 #include "app/format.h"
 #include "app/history_data.h"
 #include "app/logo_cache.h"
+#include "app/net_link.h"
 #include "app/settings.h"
 #include "app/stock_api.h"
 #include "app/stock_data.h"
 
 #include <stdio.h>
 #include <string.h>
-
-#include "lwip/ip4_addr.h"
-#include "lwip/netif.h"
-
-extern struct netif gnetif;
 
 static void wait_for_refresh_or_settings(uint32_t delay_ms,
                                          uint32_t settings_seen)
@@ -29,19 +25,21 @@ static void wait_for_refresh_or_settings(uint32_t delay_ms,
 
 static void net_wait_for_ip(void)
 {
-  printf("[net] waiting for link + DHCP...\r\n");
-  for (;;)
+  printf("[net] waiting for a link (ethernet or wifi)...\r\n");
+  net_link_kind_t kind = NET_LINK_NONE;
+  while (kind == NET_LINK_NONE)
   {
-    if (netif_is_up(&gnetif) && !ip4_addr_isany_val(*netif_ip4_addr(&gnetif)))
-    {
-      break;
-    }
-    osDelay(200);
+    /* Ethernet normally wins the race; WiFi association takes ~10 s, so
+     * this usually returns as soon as DHCP binds on the wire. */
+    kind = net_link_wait_ready(30000U);
+    if (kind == NET_LINK_NONE) printf("[net] still no link...\r\n");
   }
 
-  printf("[net] DHCP bound. IP  = %s\r\n", ip4addr_ntoa(netif_ip4_addr(&gnetif)));
-  printf("[net]              GW  = %s\r\n", ip4addr_ntoa(netif_ip4_gw(&gnetif)));
-  printf("[net]              MASK= %s\r\n", ip4addr_ntoa(netif_ip4_netmask(&gnetif)));
+  net_link_status_t status;
+  net_link_get_status(&status);
+  printf("[net] %s up. IP  = %s\r\n", net_link_name(kind), status.ip);
+  printf("[net]          GW  = %s\r\n", status.gateway);
+  printf("[net]          MASK= %s\r\n", status.netmask);
 }
 
 void StartNetTask(void const *argument)

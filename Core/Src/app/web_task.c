@@ -1,5 +1,6 @@
 #include "app/web_task.h"
 #include "app/format.h"
+#include "app/net_link.h"
 #include "app/settings.h"
 #include "app/stock_data.h"
 
@@ -7,14 +8,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "lwip/inet.h"
-#include "lwip/netif.h"
-#include "lwip/sockets.h"
+#include "cmsis_os.h"
 
 #define WEB_BUFFER_ADDR ((char *)0xC0068000U)
 #define WEB_BUFFER_SIZE (20U * 1024U)
 
-extern struct netif gnetif;
+/* How long a connected browser may dawdle mid-request before we give up. */
+#define WEB_CLIENT_TIMEOUT_MS 5000U
 
 static size_t append(char *buffer, size_t used, const char *text)
 {
@@ -105,6 +105,35 @@ static size_t append_symbols_page(char *buffer)
   }
   used = append(buffer, used, "</table>");
 
+  /* Price alerts are pushed over Bluetooth (HC-05), so they are only useful
+   * with a paired phone - say so rather than leaving a dead-looking form. */
+  float alert_above[APP_MAX_SYMBOLS];
+  float alert_below[APP_MAX_SYMBOLS];
+  settings_get_alerts(alert_above, alert_below);
+  used = append(buffer, used, "<h2>Price Alerts</h2><table>");
+  for (size_t i = 0; i < symbol_count; ++i)
+  {
+    char row[620];
+    char high[20];
+    char low[20];
+    format_decimal_2(high, sizeof(high), alert_above[i], 0);
+    format_decimal_2(low, sizeof(low), alert_below[i], 0);
+    snprintf(row, sizeof(row),
+             "<tr><td><strong>%s</strong></td><td>"
+             "<form class=add method=POST action=/alerts>"
+             "<input type=hidden name=i value=%u>"
+             "<input name=above type=number step=any min=0 value=%s "
+             "placeholder=above style='width:96px;flex:none'>"
+             "<input name=below type=number step=any min=0 value=%s "
+             "placeholder=below style='width:96px;flex:none'>"
+             "<button class=del type=submit>Set</button></form></td></tr>",
+             symbols[i], (unsigned)i, high, low);
+    used = append(buffer, used, row);
+  }
+  used = append(buffer, used,
+      "</table><p class=muted>0 disables that side. Alerts are delivered to "
+      "a phone paired with the HC-05 over Bluetooth.</p>");
+
   char form[2300];
   snprintf(form, sizeof(form),
     "<datalist id=symbols><option value=AAPL><option value=MSFT><option value=GOOGL>"
@@ -152,24 +181,27 @@ static void url_decode(char *value)
   *out = '\0';
 }
 
-static void send_all(int client, const char *data, size_t length)
+static void send_all(net_conn_t *client, const char *data, size_t length)
 {
   size_t sent = 0;
   while (sent < length)
   {
-    int result = send(client, data + sent, length - sent, 0);
+    /* net_conn_send splits to the ESP-01's 2 kB AT+CIPSEND limit itself. */
+    int result = net_conn_send(client, (const uint8_t *)data + sent,
+                               length - sent);
     if (result <= 0) break;
     sent += (size_t)result;
   }
 }
 
-static int receive_request(int client, char *request, size_t capacity)
+static int receive_request(net_conn_t *client, char *request, size_t capacity)
 {
   size_t used = 0;
   size_t expected = 0;
   while (used < capacity - 1U)
   {
-    int received = recv(client, request + used, capacity - 1U - used, 0);
+    int received = net_conn_recv(client, (uint8_t *)request + used,
+                                 capacity - 1U - used);
     if (received <= 0) break;
     used += (size_t)received;
     request[used] = '\0';
@@ -216,7 +248,7 @@ static char *form_value(char *request, const char *name)
   return NULL;
 }
 
-static void handle_client(int client)
+static void handle_client(net_conn_t *client)
 {
   char request[1536];
   int received = receive_request(client, request, sizeof(request));
@@ -245,6 +277,21 @@ static void handle_client(int client)
                           strtof(quantity, NULL));
     }
   }
+  else if (strncmp(request, "POST /alerts ", 13) == 0)
+  {
+    /* Same trap as /shares: form_value() null-terminates at the trailing
+     * '&', so fields must be read back-to-front or the earlier read hides
+     * the later ones. Body order is i, above, below. */
+    char *below = form_value(request, "below");
+    char *above = form_value(request, "above");
+    char *index = form_value(request, "i");
+    if (index != NULL)
+    {
+      settings_set_alert((size_t)strtoul(index, NULL, 10),
+                         above != NULL ? strtof(above, NULL) : 0.0f,
+                         below != NULL ? strtof(below, NULL) : 0.0f);
+    }
+  }
   else if (strncmp(request, "POST /settings ", 15) == 0)
   {
     char *refresh = form_value(request, "refresh_s");
@@ -268,28 +315,54 @@ void StartWebTask(void const *argument)
 {
   (void)argument;
   settings_storage_load();
-  while (ip4_addr_isany_val(*netif_ip4_addr(&gnetif))) osDelay(250);
 
-  int server = socket(AF_INET, SOCK_STREAM, 0);
-  struct sockaddr_in address = { 0 };
-  address.sin_family = AF_INET;
-  address.sin_port = lwip_htons(80);
-  address.sin_addr.s_addr = PP_HTONL(INADDR_ANY);
-  if (server < 0 || bind(server, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-      listen(server, 2) != 0)
-  {
-    printf("[web] failed to listen on port 80\r\n");
-    osThreadTerminate(NULL);
-  }
+  net_server_t server = { .kind = NET_LINK_NONE, .id = -1 };
+  net_link_kind_t serving = NET_LINK_NONE;
 
-  printf("[web] admin ready: http://%s/\r\n", ip4addr_ntoa(netif_ip4_addr(&gnetif)));
   for (;;)
   {
-    int client = accept(server, NULL, NULL);
-    if (client >= 0)
+    net_link_kind_t active = net_link_active();
+
+    /* The listener belongs to one link. When Ethernet comes or goes we tear
+     * it down and re-open on whatever is carrying traffic now, so the admin
+     * page follows the board rather than dying with the cable. */
+    if (active != serving)
     {
-      handle_client(client);
-      closesocket(client);
+      if (serving != NET_LINK_NONE)
+      {
+        net_server_close(&server);
+        serving = NET_LINK_NONE;
+      }
+
+      if (active == NET_LINK_NONE)
+      {
+        osDelay(500);
+        continue;
+      }
+
+      if (net_server_open(&server, 80) != 0)
+      {
+        printf("[web] cannot listen on port 80 over %s\r\n",
+               net_link_name(active));
+        osDelay(2000);
+        continue;
+      }
+
+      serving = active;
+      net_link_status_t status;
+      net_link_get_status(&status);
+      printf("[web] admin ready over %s: http://%s/\r\n",
+             net_link_name(active), status.ip);
+    }
+
+    /* A bounded accept is what lets this loop notice a link change; it is
+     * not a busy-wait, the task sleeps inside it. */
+    net_conn_t client;
+    if (net_server_accept(&server, &client, 1000U) == 0)
+    {
+      client.timeout_ms = WEB_CLIENT_TIMEOUT_MS;
+      handle_client(&client);
+      net_conn_close(&client);
     }
   }
 }

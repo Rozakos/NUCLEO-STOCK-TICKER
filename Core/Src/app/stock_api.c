@@ -1,5 +1,6 @@
 #include "app/stock_api.h"
 #include "app/config.h"
+#include "app/net_link.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -9,8 +10,6 @@
 
 #include "FreeRTOS.h"
 #include "cJSON.h"
-#include "lwip/api.h"
-#include "lwip/sockets.h"
 #include "main.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
@@ -74,22 +73,22 @@ static int hardware_entropy(void *context, unsigned char *output, size_t len,
   return 0;
 }
 
-static int socket_send(void *context, const unsigned char *buffer, size_t len)
+/* mbedTLS BIO over net_link, so the same TLS session runs unchanged whether
+ * the bytes leave over Ethernet or the ESP-01. */
+static int link_send(void *context, const unsigned char *buffer, size_t len)
 {
-  int socket_fd = *(int *)context;
-  int result = send(socket_fd, buffer, len, 0);
+  int result = net_conn_send((net_conn_t *)context, buffer, len);
   return result >= 0 ? result : MBEDTLS_ERR_NET_SEND_FAILED;
 }
 
-static int socket_recv(void *context, unsigned char *buffer, size_t len)
+static int link_recv(void *context, unsigned char *buffer, size_t len)
 {
-  int socket_fd = *(int *)context;
-  int result = recv(socket_fd, buffer, len, 0);
+  int result = net_conn_recv((net_conn_t *)context, buffer, len);
   if (result >= 0)
   {
     return result;
   }
-  if (errno == EWOULDBLOCK || errno == EAGAIN)
+  if (result == NET_CONN_WOULDBLOCK)
   {
     return MBEDTLS_ERR_SSL_WANT_READ;
   }
@@ -105,39 +104,26 @@ static void format_tls_error(char *error, size_t error_size, const char *stage,
            (unsigned)-code);
 }
 
-static int connect_socket(const char *host, uint16_t port, char *error,
-                          size_t error_size)
+static int connect_link(net_conn_t *conn, const char *host, uint16_t port,
+                        char *error, size_t error_size)
 {
-  ip_addr_t address;
-  if (netconn_gethostbyname(host, &address) != ERR_OK)
+  net_link_kind_t link = net_link_active();
+  if (link == NET_LINK_NONE)
   {
-    snprintf(error, error_size, "DNS failed");
+    snprintf(error, error_size, "no network link");
     return -1;
   }
 
-  int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (socket_fd < 0)
+  /* DNS resolution happens inside net_conn_open - over LwIP for Ethernet,
+   * inside the module for WiFi. */
+  if (net_conn_open(conn, host, port) != 0)
   {
-    snprintf(error, error_size, "socket failed");
+    snprintf(error, error_size, "TCP connect failed (%s)",
+             net_link_name(link));
     return -1;
   }
 
-  struct timeval timeout = { .tv_sec = 12, .tv_usec = 0 };
-  setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-  setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-
-  struct sockaddr_in server = { 0 };
-  server.sin_family = AF_INET;
-  server.sin_port = lwip_htons(port);
-  server.sin_addr.s_addr = ip_addr_get_ip4_u32(&address);
-  if (connect(socket_fd, (struct sockaddr *)&server, sizeof(server)) != 0)
-  {
-    snprintf(error, error_size, "TCP connect failed");
-    closesocket(socket_fd);
-    return -1;
-  }
-
-  return socket_fd;
+  return 0;
 }
 
 /* ---- Persistent TLS connection ------------------------------------------
@@ -155,17 +141,16 @@ static mbedtls_ssl_config tls_config;
 static mbedtls_ssl_context tls_ssl;
 static mbedtls_ssl_session tls_session;
 static bool tls_session_valid;
-static int tls_socket = -1;
+static net_conn_t tls_conn = { .kind = NET_LINK_NONE, .id = -1 };
 
 #define HTTP_RESPONSE_TIMEOUT_MS 20000U
 
 static void tls_disconnect(void)
 {
-  if (tls_socket >= 0)
+  if (net_conn_is_open(&tls_conn))
   {
     mbedtls_ssl_close_notify(&tls_ssl);
-    closesocket(tls_socket);
-    tls_socket = -1;
+    net_conn_close(&tls_conn);
   }
 }
 
@@ -239,7 +224,16 @@ static int tls_stack_init(char *error, size_t error_size)
 
 static int tls_connect(char *error, size_t error_size)
 {
-  if (tls_socket >= 0) return 0;
+  /* A kept-alive connection is only good while its link is still the active
+   * one; after a failover its socket belongs to a link nobody routes over. */
+  if (net_conn_is_open(&tls_conn) && tls_conn.kind != net_link_active())
+  {
+    printf("[tls] link changed to %s; dropping kept-alive connection\r\n",
+           net_link_name(net_link_active()));
+    net_conn_close(&tls_conn);
+  }
+
+  if (net_conn_is_open(&tls_conn)) return 0;
 
   int ret = mbedtls_ssl_session_reset(&tls_ssl);
   if (ret != 0)
@@ -253,10 +247,12 @@ static int tls_connect(char *error, size_t error_size)
     tls_session_valid = false;   /* resumption is best-effort */
   }
 
-  tls_socket = connect_socket(STOCK_API_HOST, STOCK_API_PORT, error,
-                              error_size);
-  if (tls_socket < 0) return -1;
-  mbedtls_ssl_set_bio(&tls_ssl, &tls_socket, socket_send, socket_recv, NULL);
+  if (connect_link(&tls_conn, STOCK_API_HOST, STOCK_API_PORT, error,
+                   error_size) != 0)
+  {
+    return -1;
+  }
+  mbedtls_ssl_set_bio(&tls_ssl, &tls_conn, link_send, link_recv, NULL);
 
   uint32_t handshake_start = HAL_GetTick();
   while ((ret = mbedtls_ssl_handshake(&tls_ssl)) != 0)
@@ -264,8 +260,7 @@ static int tls_connect(char *error, size_t error_size)
     if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE)
     {
       format_tls_error(error, error_size, "TLS handshake", ret);
-      closesocket(tls_socket);
-      tls_socket = -1;
+      net_conn_close(&tls_conn);
       return -1;
     }
   }
@@ -499,7 +494,7 @@ static int https_get(const char *path, char **body, size_t *body_len,
 
   for (int attempt = 0; attempt < 2; ++attempt)
   {
-    bool reusing = (tls_socket >= 0);
+    bool reusing = net_conn_is_open(&tls_conn);
     if (tls_connect(error, error_size) != 0)
     {
       return -1;   /* a fresh connect failed; retrying would do the same */

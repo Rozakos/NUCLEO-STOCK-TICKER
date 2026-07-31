@@ -26,7 +26,10 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include "app/bt_console.h"
 #include "app/display.h"
+#include "app/hc05.h"
+#include "app/net_link.h"
 #include "app/net_task.h"
 #include "app/settings.h"
 #include "app/ui_task.h"
@@ -1640,6 +1643,10 @@ static void MPU_Config_SDRAM(void)
 int __io_putchar(int ch)
 {
   HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+  /* Mirror to the HC-05 so the log can be watched over Bluetooth without the
+   * ST-Link cable. Queues into a ring and never blocks (and is a no-op until
+   * hc05_init() runs), so it cannot slow the wired console down. */
+  hc05_log_putchar((char)ch);
   return ch;
 }
 
@@ -1688,6 +1695,15 @@ void StartDefaultTask(void const * argument)
     printf("[fatal] app task creation failed\r\n");
     Error_Handler();
   }
+
+  /* Brings up the ESP-01 and keeps WiFi associated as an alternate link.
+   * Started last and at low priority: LwIP/Ethernet needs no help here, and
+   * a missing or unpowered module must not delay the app tasks. */
+  net_link_start();
+
+  /* HC-05 Bluetooth: admin console, log mirror and price alerts. Independent
+   * of the network - it is most useful exactly when there is no link. */
+  bt_console_start();
 
   /* Infinite loop */
   for(;;)

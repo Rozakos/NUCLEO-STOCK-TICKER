@@ -18,6 +18,13 @@ bool settings_delete_symbol(size_t index);
 void settings_get_shares(float shares[APP_MAX_SYMBOLS]);
 bool settings_set_shares(size_t index, float quantity);
 bool settings_set_shares_csv(const char *csv);
+/* Price-alert thresholds, index-aligned with settings_get_symbols().
+ * 0 (or negative) disables that side. Both may be set on one symbol. */
+void settings_get_alerts(float above[APP_MAX_SYMBOLS],
+                         float below[APP_MAX_SYMBOLS]);
+bool settings_set_alert(size_t index, float above, float below);
+/* CSV of "above|below" pairs, e.g. "150|0,0|90,0|0" - the persisted form. */
+bool settings_set_alerts_csv(const char *csv);
 uint32_t settings_get_refresh_seconds(void);
 bool settings_set_refresh_seconds(uint32_t seconds);
 uint32_t settings_generation(void);

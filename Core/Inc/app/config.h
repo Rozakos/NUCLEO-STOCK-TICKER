@@ -46,4 +46,20 @@
 /* ---- Console ------------------------------------------------------------ */
 /* printf() is retargeted to USART1 (ST-Link VCP) at 115200 8N1. */
 
+/* ---- HC-05 Bluetooth (UART7 on Arduino A4/A5) ---------------------------
+ * 9600 is the HC-05's factory data-mode baud, so this works with a module
+ * straight out of the bag. To go faster, put the module in AT mode (hold KEY
+ * high while powering up) and issue AT+UART=115200,0,0 - then change this to
+ * match. See AGENTS.md §9. */
+#define HC05_BAUD                 9600U
+
+/* Mirror the printf debug console over Bluetooth at boot. Toggle at runtime
+ * with the console's "log off" / "log on" commands - the mirror interleaves
+ * with command replies, which is useful while watching a bring-up and noisy
+ * while typing. */
+#define HC05_LOG_MIRROR_DEFAULT   1
+
+/* How often the console re-evaluates price alerts. */
+#define ALERT_POLL_MS             2000U
+
 #endif /* APP_CONFIG_H */

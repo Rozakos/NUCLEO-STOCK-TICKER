@@ -5,6 +5,7 @@
 #include "app/history_data.h"
 #include "app/logo_cache.h"
 #include "app/logos.h"
+#include "app/net_link.h"
 #include "app/settings.h"
 #include "app/stock_data.h"
 #include "app/touch_ft5336.h"
@@ -15,9 +16,6 @@
 
 #include "cmsis_os.h"
 #include "lvgl.h"
-#include "lwip/dns.h"
-#include "lwip/ip4_addr.h"
-#include "lwip/netif.h"
 #include "main.h"
 
 #define FRAMEBUFFER_SIZE (LCD_WIDTH * LCD_HEIGHT * 2U)
@@ -56,7 +54,6 @@
 #define DETAIL_MARKER_SIZE 8
 #define DETAIL_NUM_RANGES 7
 
-extern struct netif gnetif;
 extern LTDC_HandleTypeDef hltdc;
 
 typedef struct
@@ -794,17 +791,32 @@ static void update_rows(void)
     update_spark(&rows[row], snapshot, accent);
   }
 
-  /* Status icon goes red when the link drops or the lease is lost. */
-  bool online = netif_is_link_up(&gnetif) &&
-                !ip4_addr_isany_val(*netif_ip4_addr(&gnetif));
-  lv_color_t link_color = online ? lv_color_hex(0x4ADE80)
-                                 : lv_color_hex(0xF87171);
-  lv_obj_set_style_text_color(link_label, link_color, 0);
-  lv_obj_set_style_border_color(eth_icon, link_color, 0);
+  /* Whichever link is carrying traffic lights up; the other dims. With
+   * nothing up the wired icon goes red - that is the one the user can act
+   * on by checking the cable. */
+  net_link_kind_t link_kind = net_link_active();
+  lv_color_t active_color = lv_color_hex(0x4ADE80);
+  lv_color_t idle_color = lv_color_hex(0x475569);
+  lv_color_t down_color = lv_color_hex(0xF87171);
+
+  lv_color_t eth_color = (link_kind == NET_LINK_ETH)  ? active_color
+                       : (link_kind == NET_LINK_NONE) ? down_color
+                                                      : idle_color;
+  lv_color_t wifi_color = (link_kind == NET_LINK_WIFI) ? active_color
+                                                       : idle_color;
+
+  lv_label_set_text(link_label,
+                    link_kind == NET_LINK_ETH  ? "Ethernet" :
+                    link_kind == NET_LINK_WIFI ? "WiFi" : "Offline");
+  lv_obj_set_style_text_color(link_label,
+                              link_kind == NET_LINK_NONE ? down_color
+                                                         : active_color, 0);
+  lv_obj_set_style_text_color(wifi_label, wifi_color, 0);
+  lv_obj_set_style_border_color(eth_icon, eth_color, 0);
   for (uint32_t child = 0; child < lv_obj_get_child_count(eth_icon); ++child)
   {
     lv_obj_set_style_bg_color(lv_obj_get_child(eth_icon, (int32_t)child),
-                              link_color, 0);
+                              eth_color, 0);
   }
 
   /* Right side of the bar: portfolio total + day P/L. When refreshes stop
@@ -1456,26 +1468,17 @@ static void link_clicked(lv_event_t *event)
   lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(card, LV_OBJ_FLAG_EVENT_BUBBLE);   /* tap closes too */
 
-  bool link_up = netif_is_link_up(&gnetif);
-  bool bound = !ip4_addr_isany_val(*netif_ip4_addr(&gnetif));
+  net_link_status_t link;
+  net_link_get_status(&link);
+  bool online = (link.kind != NET_LINK_NONE);
 
   lv_obj_t *title = lv_label_create(card);
-  lv_label_set_text(title, LV_SYMBOL_WIFI "  ETHERNET");
-  lv_obj_set_style_text_color(title, link_up && bound
+  lv_label_set_text(title, link.kind == NET_LINK_WIFI
+      ? LV_SYMBOL_WIFI "  WIFI" : LV_SYMBOL_WIFI "  ETHERNET");
+  lv_obj_set_style_text_color(title, online
       ? lv_color_hex(0x4ADE80) : lv_color_hex(0xF87171), 0);
   lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
   lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
-
-  /* ip4addr_ntoa() reuses one static buffer - use the _r variants. */
-  char ip[16], gateway[16], netmask[16], dns[16] = "-";
-  ip4addr_ntoa_r(netif_ip4_addr(&gnetif), ip, sizeof(ip));
-  ip4addr_ntoa_r(netif_ip4_gw(&gnetif), gateway, sizeof(gateway));
-  ip4addr_ntoa_r(netif_ip4_netmask(&gnetif), netmask, sizeof(netmask));
-  const ip_addr_t *dns_server = dns_getserver(0);
-  if (dns_server != NULL && !ip_addr_isany(dns_server))
-  {
-    ipaddr_ntoa_r(dns_server, dns, sizeof(dns));
-  }
 
   char text[300];
   snprintf(text, sizeof(text),
@@ -1484,14 +1487,14 @@ static void link_clicked(lv_event_t *event)
            "Gateway     %s\n"
            "Netmask     %s\n"
            "DNS         %s\n"
-           "MAC         %02X:%02X:%02X:%02X:%02X:%02X\n"
+           "MAC         %s\n"
            "Web admin   http://%s/\n"
            "Uptime      %lus",
-           link_up ? (bound ? "up (DHCP bound)" : "up (no lease)") : "DOWN",
-           bound ? ip : "-", gateway, netmask, dns,
-           gnetif.hwaddr[0], gnetif.hwaddr[1], gnetif.hwaddr[2],
-           gnetif.hwaddr[3], gnetif.hwaddr[4], gnetif.hwaddr[5],
-           bound ? ip : "-",
+           link.link_up ? (link.bound ? "up (DHCP bound)" : "up (no lease)")
+                        : "DOWN",
+           link.bound ? link.ip : "-", link.gateway, link.netmask, link.dns,
+           link.mac,
+           link.bound ? link.ip : "-",
            (unsigned long)(HAL_GetTick() / 1000U));
 
   lv_obj_t *info = lv_label_create(card);
@@ -1547,18 +1550,23 @@ static void create_market_screen(void)
   link_label = lv_label_create(bar);
   lv_label_set_text(link_label, "Ethernet");
   lv_obj_set_style_text_color(link_label, lv_color_hex(0x4ADE80), 0);
+  /* Fixed width: the text switches between Ethernet/WiFi/Offline at runtime
+   * and a shrink-to-fit label would drag the WiFi glyph left with it. */
+  lv_obj_set_width(link_label, 64);
   lv_obj_align(link_label, LV_ALIGN_LEFT_MID, 22, 0);
   /* Tap the icon for the connection-info popup. */
   lv_obj_add_flag(link_label, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_set_ext_click_area(link_label, 10);
   lv_obj_add_event_cb(link_label, link_clicked, LV_EVENT_CLICKED, NULL);
 
-  /* WiFi support is coming; the greyed symbol reserves its spot. */
+  /* Lights up green once the ESP-01 is the link carrying traffic. */
   wifi_label = lv_label_create(bar);
   lv_label_set_text(wifi_label, LV_SYMBOL_WIFI);
   lv_obj_set_style_text_color(wifi_label, lv_color_hex(0x475569), 0);
-  lv_obj_update_layout(bar);
-  lv_obj_align_to(wifi_label, link_label, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+  lv_obj_align(wifi_label, LV_ALIGN_LEFT_MID, 94, 0);
+  lv_obj_add_flag(wifi_label, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_ext_click_area(wifi_label, 10);
+  lv_obj_add_event_cb(wifi_label, link_clicked, LV_EVENT_CLICKED, NULL);
 
   title_label = lv_label_create(bar);
   lv_label_set_text(title_label, "MARKETS");

@@ -17,8 +17,9 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
 - Display: onboard **480×272** RK043FN48H panel (LTDC), framebuffer in SDRAM @ `0xC0000000`.
 - Touch: **FT5336** capacitive over **I2C3** (source used XPT2046 resistive).
 - UI: **LVGL 9.x** (same as source).
-- Network: **Ethernet** (LAN8742A RMII) + **LwIP**, then **mbedTLS** for HTTPS.
-  WiFi is a later milestone.
+- Network: **Ethernet** (LAN8742A RMII) + **LwIP** + **mbedTLS** for HTTPS, with
+  **WiFi via an ESP-01** on USART6 as an automatic fallback link (§8). Both links
+  sit behind `app/net_link.h`; TLS always runs on the STM32.
 - JSON: **cJSON** (source used ArduinoJson).
 - Data: self-hosted yfinance proxy `https://rozakos.eu/stocks/api/v1`, bearer-token auth.
   Endpoints: `GET /stocks?symbols=A,B,C` (batch quotes), `GET /stock/{symbol}`,
@@ -61,6 +62,9 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
    NOT hand-vendored — because `main.c` already owns the ETH handle/descriptors and CubeMX
    generates a matched `ethernetif.c`/`lwip.c` + patches linker & MPU. Same plan for mbedTLS.
 6. TLS: start with `TLS_INSECURE_SKIP_VERIFY=1` (bring-up), then pin the CA.
+7. WiFi = **ESP-01 as a socket provider, not an LwIP netif** (stock AT firmware
+   has no PPP/SLIP server). Everything TCP goes through `app/net_link.h` so the
+   TLS client and web server are link-agnostic; Ethernet is always preferred.
 
 ## 4. Layout / conventions
 
@@ -133,7 +137,20 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
       a session-view dropdown (Full day / Pre-market / Live market / After hours), gated
       by which segments have data. Verified on target during pre-market; market/after
       states pending a live session.
-- [ ] Later: WiFi as alternate netif.
+- [~] **WiFi via ESP-01 (2026-07-31)**: code complete, **not yet run on hardware**
+      (module in hand, not wired). New `app/esp01.{c,h}` AT driver on USART6 and
+      `app/net_link.{c,h}`, a TCP abstraction that both the TLS stock-API client
+      and the port-80 web admin now sit on, so both work over either link.
+      Ethernet stays preferred; WiFi is the automatic fallback. NOT an LwIP netif
+      — stock AT firmware has no PPP/SLIP, so the module is a socket provider and
+      mbedTLS (incl. the pinned CA) keeps running on the STM32. Requires
+      `AT+CIPRECVMODE` (AT ≥ 1.7) and a separate 3.3 V supply — see §8.
+- [~] **Bluetooth via HC-05 (2026-07-31)**: code complete, **not yet run on
+      hardware**. `app/hc05.{c,h}` (UART7 on Arduino A4/A5, hand-configured —
+      no `.ioc` change) + `app/bt_console.{c,h}`: an SPP admin console
+      (watchlist/shares/refresh/alerts), the printf debug log mirrored to a
+      phone, and edge-triggered per-symbol price alerts. SPP is a serial
+      cable, not IP — it cannot fetch quotes. See §9.
 
 ## 6. NEXT ACTION (start here)
 
@@ -141,14 +158,28 @@ Everything through the extended-hours 1D chart is flashed; pre-market state veri
 on target (2026-07-09).
 
 **DO THIS NEXT:**
-1. **Verify the 1D session-view dropdown through a full trading day** — it shipped
+1. **Bring up the ESP-01 on hardware — nothing about it has ever run.** Wire it
+   per §8 (external 3.3 V supply is the part people get wrong), fill in
+   `WIFI_SSID`/`WIFI_PASSWORD` in the git-ignored `Core/Inc/app/secrets.h`
+   (they currently sit empty, which disables WiFi), flash, and watch COM4 for:
+   `[esp] firmware: ...` → `[esp] ready` → `[link] wifi up`. Then unplug the
+   Ethernet cable and confirm quotes keep arriving and `http://<wifi-ip>/`
+   serves the admin page. If the module answers `AT` then dies during
+   association, suspect the 3.3 V rail before the code.
+2. **Bring up the HC-05 on hardware — also never run.** Wire per §9 (A4/A5),
+   pair from a phone with any SPP terminal app, and expect
+   `[bt] HC-05 ready on UART7 @ 9600 baud` on COM4 followed by the greeting
+   over Bluetooth. Try `help`, `list`, `alert 0 above <price>`. At 9600 the
+   log mirror will drop bytes during bursts — `log off` gives a clean console,
+   and `status` reports the dropped count. Independent of the ESP-01: these
+   two can be brought up in either order.
+3. **Verify the 1D session-view dropdown through a full trading day** — it shipped
    during pre-market, when the dropdown is intentionally inert. During the live session
    (16:30–23:00 Greece time) re-tapping the active 1D button should offer Full day /
    Pre-market / Live market; after close, After hours joins. Optional polish, explicitly
    NOT done (the dropdown replaced it per user direction): drawing the pre/post segments
    of the Full-day view in the amber accent (0xFBBF24).
-2. WiFi as an alternate netif (the status bar already reserves a dimmed WiFi icon).
-3. Debugging a hang/crash? See the device-debug workflow: serial on COM4, web-UI POSTs
+4. Debugging a hang/crash? See the device-debug workflow: serial on COM4, web-UI POSTs
    via `Invoke-WebRequest -UseBasicParsing`, and hot-attach forensics with
    `STM32_Programmer_CLI -c port=SWD mode=HOTPLUG -r32/-coreReg` +
    `arm-none-eabi-addr2line`. A FreeRTOS stack overflow presents as total silent death
@@ -182,7 +213,207 @@ starts it from `freertos.c`/`main.c` USER CODE, and verifies over UART.
 - Don't commit `secrets.h`. Don't edit generated code outside USER CODE blocks.
 - Many Disco peripherals are enabled but unused (DCMI/SAI/SPDIF/QSPI/USB host) — ignore them.
 
-## 8. Session log
+## 8. ESP-01 WiFi module (wiring, firmware, limits)
+
+**Status: code complete, NEVER RUN ON HARDWARE.** Written 2026-07-31 against the
+AT command set; the module was not yet wired when it was written. Treat every
+claim below as "designed to", not "verified".
+
+### Wiring — STM32F746G-DISCO Arduino header (CN4/CN7)
+
+The ESP-01's 2×4 header, pin 1 = the corner nearest the antenna edge:
+
+| ESP-01 | Connect to | Note |
+|---|---|---|
+| `VCC`  | **external 3.3 V**, ≥ 300 mA | *not* the DISCO's 3V3 pin — see below |
+| `GND`  | DISCO `GND` | must be common with the external supply |
+| `CH_PD` (EN) | 3.3 V via 10 kΩ | module stays in reset if this floats |
+| `RST`  | 3.3 V via 10 kΩ, or leave open | pull low briefly to reset |
+| `TXD`  | **PC7** = Arduino **D0** (USART6_RX) | |
+| `RXD`  | **PC6** = Arduino **D1** (USART6_TX) | 3.3 V logic, no level shifter needed |
+| `GPIO0`/`GPIO2` | leave open | GPIO0 low at boot = flash mode |
+
+**Power is the classic failure here.** The ESP8266 draws ~70 mA idle but
+spikes to ~300 mA on TX. The DISCO's 3V3 Arduino pin comes off the on-board
+regulator with little headroom, and a brown-out shows up as the module
+answering `AT` and then dying mid-association. Use a separate 3.3 V supply
+(an AMS1117 module off 5 V is fine) with grounds tied together, and put
+100 nF + 100 µF across the ESP's VCC/GND.
+
+USART6 was already configured in the `.ioc` at 115200 8N1, so **no CubeMX
+regeneration is needed**. `esp01_init()` only adds the RX interrupt.
+
+### Firmware requirement
+
+The driver **requires `AT+CIPRECVMODE=1`** (passive receive, ESP8266 AT ≥ 1.7).
+This is not optional: the 8-pin ESP-01 exposes no RTS/CTS, so in the default
+push mode a 25 kB logo PNG overruns the UART and silently corrupts the TLS
+stream. On older firmware `esp01_init()` logs
+
+```
+[esp] AT+CIPRECVMODE unsupported - this AT firmware is too old.
+```
+
+and WiFi stays disabled (Ethernet is unaffected). Fix by flashing current
+ESP8266 AT firmware — note the 512 kB ESP-01 cannot hold it; the 1 MB
+**ESP-01S** can. `esp01_init()` prints `AT+GMR` at boot so the version is
+visible on COM4 immediately.
+
+Also: ESP8266 is **2.4 GHz only**. A 5 GHz-only SSID will never be found.
+
+### Design constraints baked in
+
+- Stock AT firmware has **no PPP/SLIP server**, so the ESP-01 *cannot* be an
+  LwIP netif (§5 previously assumed it could). It is a socket provider:
+  it owns WiFi/DHCP/DNS/TCP, mbedTLS stays on the STM32. CA pinning and TLS
+  session resumption therefore work identically on both links.
+- `AT+CIPMUX=1` gives **4 usable link ids** (0-3; id 4 is the AT server's own
+  listener). The TLS client holds one, so at most 3 concurrent web clients.
+- One serial channel is shared by the net and web tasks, so every AT exchange
+  is mutex-serialised in `esp01.c`.
+- Throughput is bounded by 115200 baud ≈ 11.5 kB/s: a 25 kB logo takes ~2 s
+  on the wire. Raising it (`AT+UART_CUR`) is an untried future optimisation.
+- Credentials are compile-time (`WIFI_SSID`/`WIFI_PASSWORD` in the git-ignored
+  `secrets.h`). Empty SSID = the module is never probed, Ethernet only.
+
+### Failover behaviour
+
+`net_link.c` prefers Ethernet whenever it has link + lease, and falls back to
+WiFi otherwise. The supervisor task keeps WiFi associated even while Ethernet
+carries traffic, so unplugging the cable does not pay the ~10 s association
+cost. On a switch: `stock_api.c` drops its kept-alive TLS connection (the
+socket belongs to the old link) and `web_task.c` re-opens its listener on the
+new one, so `http://<board-ip>/` follows the board.
+
+## 9. HC-05 Bluetooth module (wiring, console, alerts)
+
+**Status: code complete, NEVER RUN ON HARDWARE** (written 2026-07-31 alongside
+the ESP-01 work). Same caveat as §8 — treat as "designed to", not "verified".
+
+### What it is and is not
+
+The HC-05 is **Bluetooth 2.0 SPP — a wireless serial cable**. It carries no IP,
+so unlike the ESP-01 it can never be a `net_link` and cannot fetch quotes. It
+is for talking *to* the board: admin console, debug-log mirror, price alerts.
+
+### Wiring — Arduino analog header
+
+| HC-05 | Connect to | Note |
+|---|---|---|
+| `VCC` | 5 V (breakout with regulator) or 3.3 V (bare module) | ~40 mA, far gentler than the ESP-01 |
+| `GND` | DISCO `GND` | |
+| `RXD` | **PF7** = Arduino **A4** (UART7_TX) | 3.3 V logic; most breakouts tolerate it directly |
+| `TXD` | **PF6** = Arduino **A5** (UART7_RX) | |
+| `KEY`/`EN` | leave open for normal use | hold high at power-up for AT mode |
+
+**UART7 is configured entirely in `hc05.c`** (RCC, GPIO AF8, NVIC, its own
+`UART7_IRQHandler`) — deliberately *not* via CubeMX, per user direction, so
+**no `.ioc` change or regeneration is needed**. PF6/PF7 are declared as
+`ADC3_IN4`/`ADC3_IN5` in the `.ioc`, but nothing in the app touches ADC3, so
+`hc05_init()` simply reclaims them. Note this diverges from the project's
+CubeMX-first convention (§3.5): a future regeneration will not know about
+UART7, though it also will not fight it — CubeMX only re-emits ADC3 init,
+which `hc05_init()` overrides afterwards.
+
+USART assignments are now full: **USART1** = ST-Link console, **USART6** =
+ESP-01, **UART7** = HC-05.
+
+### Baud
+
+`HC05_BAUD` in `config.h` defaults to **9600**, the HC-05's factory data-mode
+rate, so it works with a module straight from the bag. To go faster: hold KEY
+high while powering the module, then `AT+UART=115200,0,0`, and change
+`HC05_BAUD` to match. At 9600 the log mirror can saturate the link during
+bursts (boot, TLS handshakes) — bytes are then **dropped, never blocked**
+(`hc05_dropped()` counts them, and `status` prints the count). Use `log off`
+for clean console output at 9600.
+
+### Console
+
+Pair from a phone with any SPP terminal app; default PIN is usually `1234` or
+`0000`. Commands: `help`, `list`, `status`, `add <SYM>`, `del <N>`,
+`shares <N> <QTY>`, `refresh <SEC>`, `alert <N> above|below <PRICE>`,
+`alert <N> off`, `log on|off`. Everything goes through the same `settings_*`
+API the web admin uses, so changes persist identically (SD `ticker.cfg`, else
+the flash blob).
+
+### Alerts
+
+Per-symbol above/below thresholds (0 = that side off), configurable from both
+the Bluetooth console and the web admin (`POST /alerts`). Evaluated every
+`ALERT_POLL_MS` (2 s) against the **extended-hours-aware** price, matching what
+the screen shows. **Edge-triggered**: fires on the crossing, re-arms when the
+price comes back through. Any watchlist edit re-arms everything, because the
+thresholds are index-aligned and a delete shifts them.
+
+### Persistence note
+
+The flash blob grew alert fields, so its magic went `STK1` -> `STK2`. A
+`flash_load_v1()` path reads the old layout and defaults the thresholds to
+zero, so **an existing watchlist survives the upgrade** instead of silently
+reverting to compile-time defaults. The SD `ticker.cfg` gained an `alerts=`
+line of `above|below` pairs; older firmware ignores the unknown key.
+
+`settings_save()` is now mutex-guarded: mutations arrive from two tasks (web
+and Bluetooth), FatFs is reentrant but `HAL_FLASH_*` is not.
+
+## 10. Session log
+
+- **2026-07-31 — Claude (Opus 5, Claude Code):** Added Bluetooth via an HC-05
+  on UART7 (user request, same session as the ESP-01 work below). **Code
+  complete, zero on-target verification** — see §9. New `app/hc05.{c,h}`
+  (UART7 hand-configured in app code per user direction — no `.ioc` change;
+  owns `UART7_IRQHandler`; interrupt-driven TX ring that **drops rather than
+  blocks** when full, because printf() is mirrored here from every task and
+  the factory 9600 baud would otherwise have made the debug console a
+  system-wide brake) and `app/bt_console.{c,h}` (SPP admin console +
+  edge-triggered price alerts). `__io_putchar` now tees to Bluetooth.
+  Scoping note: the HC-05 is SPP — a wireless serial cable with no IP — so it
+  is explicitly *not* a third `net_link` and cannot fetch quotes; it is an
+  input/notification channel only. `settings.c` gained per-symbol
+  above/below thresholds, persisted in a **v2 flash blob** with a
+  `flash_load_v1()` fallback so the existing watchlist is not wiped on
+  upgrade, plus an `alerts=` line in `ticker.cfg`; the SD config line buffer
+  went 128->256 because eight symbols of `above|below` pairs overrun 128.
+  Two hazards found and fixed while integrating: `settings_save()` is now
+  mutex-guarded (mutations arrive from both the web and Bluetooth tasks;
+  FatFs is reentrant but `HAL_FLASH_*` is not, and the tmp->cfg rename is not
+  atomic against a second writer), and the alert thresholds are shifted
+  alongside `shares` on add/delete to stay index-aligned. Web admin gained a
+  Price Alerts table and `POST /alerts`. Builds clean, text 699->707 KB.
+  **Watch the flash budget: 707 KB against the 768 KB linker cap** that
+  reserves sector 7 for the settings blob.
+
+- **2026-07-31 — Claude (Opus 5, Claude Code):** Added WiFi via an ESP-01 on
+  USART6. **Code complete, zero on-target verification** — the user has the
+  module but had not wired it; see §6 item 1 and §8. Two new modules:
+  `app/esp01.{c,h}`, an AT-command driver (RXNE-interrupt ring buffer — not
+  DMA, which would have needed MPU/cache work for an 11.5 kB/s stream; owns
+  `USART6_IRQHandler`, which the generated `stm32f7xx_it.c` did not define;
+  line-oriented response parser that dispatches URCs arriving mid-response;
+  mutex-serialised so the net and web tasks can share the one channel), and
+  `app/net_link.{c,h}`, a `net_conn_t`/`net_server_t` TCP abstraction over
+  both links plus a supervisor task. **Key finding that changed the plan:**
+  §5 had assumed "WiFi as an alternate netif", but stock ESP-AT firmware has
+  no PPP/SLIP server, so the module cannot be an LwIP netif. It is instead a
+  socket *provider* — it owns WiFi/DHCP/DNS/TCP while mbedTLS stays on the
+  STM32, which means the pinned WE1 CA, session resumption and keep-alive all
+  survive unchanged. `stock_api.c`'s three transport functions
+  (`connect_socket`/`socket_send`/`socket_recv`) became net_link calls feeding
+  `mbedtls_ssl_set_bio`; it also drops a kept-alive connection whose link is
+  no longer active. `web_task.c` was ported off raw LwIP sockets, so the
+  port-80 admin now runs over WiFi too (full parity, per user direction), and
+  its listener is rebuilt on failover. `ui_task.c`'s status icons and network
+  popup read `net_link_get_status()` — the reserved dimmed WiFi glyph now
+  lights green when WiFi is the active link, and `link_label` got a fixed
+  64 px width because its text switches between Ethernet/WiFi/Offline.
+  Second finding: `AT+CIPRECVMODE=1` (passive receive) is treated as a hard
+  requirement rather than an optimisation — the ESP-01 header has no RTS/CTS,
+  so push-mode `+IPD` bursts would overrun the UART and corrupt TLS with no
+  recovery; too-old firmware is reported and WiFi disabled instead of limping.
+  Credentials are `WIFI_SSID`/`WIFI_PASSWORD` in `secrets.h` (added empty —
+  **the user must fill these in**) and `secrets.h.example`. Builds clean at
+  -O2, text 686→699 KB.
 
 - **2026-07-09 — Claude (Fable 5, Claude Code):** Adapted to the API's `prepost=1` 1d
   history (deployed API-side 2026-07-08). `stock_api_fetch_history` appends `prepost=1`

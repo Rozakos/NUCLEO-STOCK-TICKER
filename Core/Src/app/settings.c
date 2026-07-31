@@ -7,13 +7,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cmsis_os.h"
 #include "fatfs.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "stm32f7xx_hal.h"
 
+/* Serialises settings_save(). FatFs is built reentrant, but HAL_FLASH_* is
+ * not, and the ticker.tmp -> ticker.cfg rename is not atomic against a
+ * second writer. Mutations now arrive from both the web task and the
+ * Bluetooth console, so the save path needs a lock of its own. */
+static osMutexId save_lock;
+
 static char current_symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
 static float current_shares[APP_MAX_SYMBOLS];  /* owned qty, index-aligned */
+static float current_alert_above[APP_MAX_SYMBOLS];  /* 0 = that side is off */
+static float current_alert_below[APP_MAX_SYMBOLS];
 static size_t current_count;
 static uint32_t generation;
 static uint32_t refresh_seconds;
@@ -26,7 +35,8 @@ static bool sd_ready;
  * A sector erase stalls the CPU for ~1 s (single-bank XIP), so saves skip
  * rewriting when the blob is unchanged. */
 #define SETTINGS_FLASH_ADDR  0x080C0000U
-#define SETTINGS_FLASH_MAGIC 0x53544B31U   /* "STK1" */
+#define SETTINGS_FLASH_MAGIC 0x53544B32U   /* "STK2": v1 + alert thresholds */
+#define SETTINGS_FLASH_MAGIC_V1 0x53544B31U
 
 typedef struct
 {
@@ -35,14 +45,30 @@ typedef struct
   uint32_t count;
   char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
   float shares[APP_MAX_SYMBOLS];
+  float alert_above[APP_MAX_SYMBOLS];
+  float alert_below[APP_MAX_SYMBOLS];
   uint32_t checksum;
 } settings_blob_t;
 
-static uint32_t blob_checksum(const settings_blob_t *blob)
+/* The pre-alerts layout. Adding fields moved `checksum`, so a v1 blob fails
+ * the v2 check; without this the first boot after upgrading would silently
+ * drop the user's watchlist back to compile-time defaults. */
+typedef struct
 {
-  const uint8_t *bytes = (const uint8_t *)blob;
+  uint32_t magic;
+  uint32_t refresh;
+  uint32_t count;
+  char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
+  float shares[APP_MAX_SYMBOLS];
+  uint32_t checksum;
+} settings_blob_v1_t;
+
+/* Takes an explicit length so both blob layouts can share it. */
+static uint32_t blob_checksum(const void *data, size_t length)
+{
+  const uint8_t *bytes = (const uint8_t *)data;
   uint32_t sum = 0x5A17U;
-  for (size_t i = 0; i < offsetof(settings_blob_t, checksum); ++i)
+  for (size_t i = 0; i < length; ++i)
   {
     sum = sum * 31U + bytes[i];
   }
@@ -61,8 +87,10 @@ static void flash_save(void)
   blob.count = (uint32_t)current_count;
   memcpy(blob.symbols, current_symbols, sizeof(blob.symbols));
   memcpy(blob.shares, current_shares, sizeof(blob.shares));
+  memcpy(blob.alert_above, current_alert_above, sizeof(blob.alert_above));
+  memcpy(blob.alert_below, current_alert_below, sizeof(blob.alert_below));
   taskEXIT_CRITICAL();
-  blob.checksum = blob_checksum(&blob);
+  blob.checksum = blob_checksum(&blob, offsetof(settings_blob_t, checksum));
 
   /* The stored copy may sit stale in the D-cache from an earlier read. */
   SCB_InvalidateDCache_by_Addr((uint32_t *)SETTINGS_FLASH_ADDR,
@@ -94,11 +122,55 @@ static void flash_save(void)
                           : "[settings] flash save failed\r\n");
 }
 
+/* Load a v1 (pre-alerts) blob, leaving the thresholds at zero. Keeps a
+ * watchlist configured before alerts existed from being wiped on upgrade;
+ * the next save rewrites the sector in v2 form. */
+static bool flash_load_v1(void)
+{
+  const settings_blob_v1_t *blob =
+      (const settings_blob_v1_t *)SETTINGS_FLASH_ADDR;
+  if (blob->count == 0U || blob->count > APP_MAX_SYMBOLS ||
+      blob->checksum !=
+          blob_checksum(blob, offsetof(settings_blob_v1_t, checksum)))
+  {
+    return false;
+  }
+
+  taskENTER_CRITICAL();
+  current_count = blob->count;
+  memcpy(current_symbols, blob->symbols, sizeof(current_symbols));
+  for (size_t i = 0; i < APP_MAX_SYMBOLS; ++i)
+  {
+    current_symbols[i][APP_SYMBOL_LENGTH - 1U] = '\0';
+    current_shares[i] = blob->shares[i] >= 0.0f ? blob->shares[i] : 0.0f;
+    current_alert_above[i] = 0.0f;
+    current_alert_below[i] = 0.0f;
+  }
+  if (blob->refresh >= 15U && blob->refresh <= 3600U)
+  {
+    refresh_seconds = blob->refresh;
+  }
+  ++generation;
+  taskEXIT_CRITICAL();
+  printf("[settings] loaded from flash (pre-alerts format, upgraded)\r\n");
+  return true;
+}
+
 static bool flash_load(void)
 {
   const settings_blob_t *blob = (const settings_blob_t *)SETTINGS_FLASH_ADDR;
+
+  if (blob->magic == SETTINGS_FLASH_MAGIC_V1)
+  {
+    if (flash_load_v1()) return true;
+    printf("[settings] no flash config; using defaults\r\n");
+    return false;
+  }
+
   if (blob->magic != SETTINGS_FLASH_MAGIC || blob->count == 0U ||
-      blob->count > APP_MAX_SYMBOLS || blob->checksum != blob_checksum(blob))
+      blob->count > APP_MAX_SYMBOLS ||
+      blob->checksum != blob_checksum(blob,
+                                      offsetof(settings_blob_t, checksum)))
   {
     printf("[settings] no flash config; using defaults\r\n");
     return false;
@@ -111,6 +183,10 @@ static bool flash_load(void)
   {
     current_symbols[i][APP_SYMBOL_LENGTH - 1U] = '\0';
     current_shares[i] = blob->shares[i] >= 0.0f ? blob->shares[i] : 0.0f;
+    current_alert_above[i] =
+        blob->alert_above[i] > 0.0f ? blob->alert_above[i] : 0.0f;
+    current_alert_below[i] =
+        blob->alert_below[i] > 0.0f ? blob->alert_below[i] : 0.0f;
   }
   if (blob->refresh >= 15U && blob->refresh <= 3600U)
   {
@@ -122,10 +198,8 @@ static bool flash_load(void)
   return true;
 }
 
-static void settings_save(void)
+static void settings_save_locked(void)
 {
-  if (!storage_ready) return;
-
   flash_save();
   if (!sd_ready) return;
 
@@ -156,6 +230,21 @@ static void settings_save(void)
     format_decimal_2(quantity, sizeof(quantity), shares[i], 0);
     f_printf(&file, "%s%s", i == 0U ? "" : ",", quantity);
   }
+
+  /* alerts= is "above|below" per symbol. An older firmware simply ignores
+   * the unknown key, and its absence means "no alerts configured". */
+  float above[APP_MAX_SYMBOLS];
+  float below[APP_MAX_SYMBOLS];
+  settings_get_alerts(above, below);
+  f_printf(&file, "\nalerts=");
+  for (size_t i = 0; i < count; ++i)
+  {
+    char high[20];
+    char low[20];
+    format_decimal_2(high, sizeof(high), above[i], 0);
+    format_decimal_2(low, sizeof(low), below[i], 0);
+    f_printf(&file, "%s%s|%s", i == 0U ? "" : ",", high, low);
+  }
   f_printf(&file, "\n");
   FRESULT result = f_sync(&file);
   if (f_close(&file) != FR_OK || result != FR_OK) return;
@@ -167,6 +256,15 @@ static void settings_save(void)
   }
 }
 
+static void settings_save(void)
+{
+  if (!storage_ready) return;
+
+  if (save_lock != NULL) osMutexWait(save_lock, osWaitForever);
+  settings_save_locked();
+  if (save_lock != NULL) osMutexRelease(save_lock);
+}
+
 static bool valid_symbol_char(char value)
 {
   return isalnum((unsigned char)value) || value == '.' || value == '-' ||
@@ -176,6 +274,14 @@ static bool valid_symbol_char(char value)
 void settings_init(void)
 {
   static const char *defaults[] = STOCK_SYMBOLS;
+
+  /* Runs from main() before the scheduler starts, which is exactly when the
+   * mutex must exist - by the time two tasks can race, it is already there. */
+  if (save_lock == NULL)
+  {
+    osMutexDef(settingsSaveLock);
+    save_lock = osMutexCreate(osMutex(settingsSaveLock));
+  }
 
   taskENTER_CRITICAL();
   current_count = STOCK_SYMBOL_COUNT > APP_MAX_SYMBOLS
@@ -202,7 +308,10 @@ void settings_storage_load(void)
     FIL file;
     if (f_open(&file, path, FA_READ) == FR_OK)
     {
-      char line[128];
+      /* 256, not 128: "alerts=" carries two numbers per symbol, so 8
+       * symbols can run past 150 characters and a short buffer would
+       * silently split the line and corrupt the last entry. */
+      char line[256];
       while (f_gets(line, sizeof(line), &file) != NULL)
       {
         char *newline = strpbrk(line, "\r\n");
@@ -214,6 +323,10 @@ void settings_storage_load(void)
         else if (strncmp(line, "shares=", 7) == 0)
         {
           settings_set_shares_csv(line + 7);
+        }
+        else if (strncmp(line, "alerts=", 7) == 0)
+        {
+          settings_set_alerts_csv(line + 7);
         }
         else if (strncmp(line, "refresh=", 8) == 0)
         {
@@ -286,9 +399,12 @@ bool settings_set_symbols_csv(const char *csv)
 
   taskENTER_CRITICAL();
   memcpy(current_symbols, parsed, sizeof(current_symbols));
-  /* Full list replace invalidates the index-aligned share counts; the SD
-   * loader restores them from the shares= line that follows symbols=. */
+  /* Full list replace invalidates the index-aligned share counts and alert
+   * thresholds; the SD loader restores them from the shares= and alerts=
+   * lines that follow symbols=. */
   memset(current_shares, 0, sizeof(current_shares));
+  memset(current_alert_above, 0, sizeof(current_alert_above));
+  memset(current_alert_below, 0, sizeof(current_alert_below));
   current_count = count;
   ++generation;
   taskEXIT_CRITICAL();
@@ -327,6 +443,8 @@ bool settings_add_symbol(const char *symbol)
     if (!duplicate)
     {
       current_shares[current_count] = 0.0f;
+      current_alert_above[current_count] = 0.0f;
+      current_alert_below[current_count] = 0.0f;
       memcpy(current_symbols[current_count++], parsed, sizeof(parsed));
       ++generation;
       added = true;
@@ -347,9 +465,13 @@ bool settings_delete_symbol(size_t index)
     {
       memcpy(current_symbols[i], current_symbols[i + 1U], APP_SYMBOL_LENGTH);
       current_shares[i] = current_shares[i + 1U];
+      current_alert_above[i] = current_alert_above[i + 1U];
+      current_alert_below[i] = current_alert_below[i + 1U];
     }
     memset(current_symbols[current_count - 1U], 0, APP_SYMBOL_LENGTH);
     current_shares[current_count - 1U] = 0.0f;
+    current_alert_above[current_count - 1U] = 0.0f;
+    current_alert_below[current_count - 1U] = 0.0f;
     --current_count;
     ++generation;
     deleted = true;
@@ -401,6 +523,72 @@ bool settings_set_shares_csv(const char *csv)
 
   taskENTER_CRITICAL();
   memcpy(current_shares, parsed, sizeof(current_shares));
+  ++generation;
+  taskEXIT_CRITICAL();
+  return true;
+}
+
+void settings_get_alerts(float above[APP_MAX_SYMBOLS],
+                         float below[APP_MAX_SYMBOLS])
+{
+  taskENTER_CRITICAL();
+  memcpy(above, current_alert_above, sizeof(current_alert_above));
+  memcpy(below, current_alert_below, sizeof(current_alert_below));
+  taskEXIT_CRITICAL();
+}
+
+bool settings_set_alert(size_t index, float above, float below)
+{
+  /* NaN-safe: !(x >= 0) is true for NaN. 0 means "this side is off". */
+  if (!(above >= 0.0f) || !(below >= 0.0f)) return false;
+  if (above > 9999999.0f || below > 9999999.0f) return false;
+
+  taskENTER_CRITICAL();
+  bool ok = index < current_count;
+  if (ok)
+  {
+    current_alert_above[index] = above;
+    current_alert_below[index] = below;
+    ++generation;
+  }
+  taskEXIT_CRITICAL();
+  if (ok) settings_save();
+  return ok;
+}
+
+bool settings_set_alerts_csv(const char *csv)
+{
+  float above[APP_MAX_SYMBOLS] = { 0 };
+  float below[APP_MAX_SYMBOLS] = { 0 };
+  size_t count = 0;
+
+  /* Entries are "above|below", comma separated. */
+  while (count < APP_MAX_SYMBOLS && *csv != '\0')
+  {
+    char *end;
+    float high = strtof(csv, &end);
+    if (end == csv) break;
+    csv = end;
+
+    float low = 0.0f;
+    if (*csv == '|')
+    {
+      ++csv;
+      low = strtof(csv, &end);
+      if (end == csv) low = 0.0f;
+      else csv = end;
+    }
+
+    above[count] = (high >= 0.0f) ? high : 0.0f;
+    below[count] = (low >= 0.0f) ? low : 0.0f;
+    ++count;
+
+    while (*csv == ',' || *csv == ' ') ++csv;
+  }
+
+  taskENTER_CRITICAL();
+  memcpy(current_alert_above, above, sizeof(current_alert_above));
+  memcpy(current_alert_below, below, sizeof(current_alert_below));
   ++generation;
   taskEXIT_CRITICAL();
   return true;
