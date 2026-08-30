@@ -121,6 +121,26 @@ pipeline {
                          onlyIfSuccessful: true
       }
     }
+
+    // Publishing happens ONLY on a tag build. Multibranch creates a separate job
+    // per discovered tag and sets TAG_NAME there, so buildingTag() is exact.
+    stage('Publish GitHub Release') {
+      when { buildingTag() }
+      steps {
+        withCredentials([string(credentialsId: 'github-pat', variable: 'GH_TOKEN')]) {
+          sh '''
+            set -eu
+            cp "Debug/${PROJECT}.bin" "nucleo-stock-ticker-${TAG_NAME}.bin"
+            cp "Debug/${PROJECT}.hex" "nucleo-stock-ticker-${TAG_NAME}.hex"
+            python3 scripts/publish_release.py \
+              --repo Rozakos/NUCLEO-STOCK-TICKER \
+              --tag "${TAG_NAME}" \
+              --asset "nucleo-stock-ticker-${TAG_NAME}.bin" \
+              --asset "nucleo-stock-ticker-${TAG_NAME}.hex"
+          '''
+        }
+      }
+    }
   }
 
   post {
