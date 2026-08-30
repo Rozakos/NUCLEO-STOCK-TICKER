@@ -104,7 +104,7 @@ pipeline {
           cd Debug
           "$OBJCOPY" -O binary "${PROJECT}.elf" "${PROJECT}.bin"
           "$OBJCOPY" -O ihex   "${PROJECT}.elf" "${PROJECT}.hex"
-          ls -lh "${PROJECT}".{elf,bin,hex}
+          ls -lh "${PROJECT}.elf" "${PROJECT}.bin" "${PROJECT}.hex"
 
           echo ""
           echo "STM32F746NG budget: 1024 KB flash / 320 KB RAM"
