@@ -30,9 +30,16 @@ pipeline {
 
   environment {
     CUBEIDE = '/opt/st/stm32cubeide_1.19.0/stm32cubeide'
-    // Eclipse workspace kept outside the workspace dir so cleanWs() does not
+    // Eclipse workspace kept outside the job workspace so cleanWs() does not
     // force a full re-import and rebuild every time.
-    CUBE_WS = "${JENKINS_HOME}/cube-workspace"
+    //
+    // Scoped per job/branch on purpose. Eclipse records the project's absolute
+    // path inside its workspace metadata, so a workspace shared between jobs
+    // keeps pointing at whichever path imported first - and silently builds
+    // nothing when that path no longer exists. That is exactly what happened
+    // when this repo moved from a freestyle job to multibranch: the build
+    // "succeeded", produced no .elf, and only the artifact check caught it.
+    CUBE_WS = "${JENKINS_HOME}/cube-ws/${JOB_NAME}"
     PROJECT = 'NUCLEO-STOCK-TICKER'
   }
 
@@ -65,6 +72,10 @@ pipeline {
         // Remove prior output so the freshness check below cannot be fooled by
         // a stale .elf from an earlier build.
         sh 'rm -rf Debug'
+        // A stale Eclipse workspace points at a path that no longer exists and
+        // yields a silent no-op build; re-importing into a fresh one is cheap
+        // next to compiling 412 sources.
+        sh 'rm -rf "$CUBE_WS"'
         sh '''
           set +e
           "$CUBEIDE" --launcher.suppressErrors -nosplash \
