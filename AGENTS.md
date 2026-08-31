@@ -699,3 +699,48 @@ and Bluetooth), FatFs is reentrant but `HAL_FLASH_*` is not.
   `lwipopts.h` USER CODE; added `.lwip_sec` RAM section + heap bump in `STM32F746NGHX_FLASH.ld`;
   wrote `app/net_task.{c,h}` (DHCP wait → DNS → TCP connect, logged on USART1); created the task
   in `main.c`. Token set locally in `secrets.h` (git-ignored). **Next = on-target M1 verify (§6).**
+
+## CI (self-hosted Jenkins)
+
+`https://jenkins.rozakos.eu` — job **`NUCLEO-STOCK-TICKER-MB`**, a *multibranch*
+pipeline defined by the `Jenkinsfile` here. Unlike the PlatformIO repos there is
+no Makefile: the build description lives in `.cproject`, so CI drives
+**STM32CubeIDE 1.19.0's headless CDT builder**, installed on the controller at
+`/opt/st/stm32cubeide_1.19.0` (it bundles its own arm-none-eabi-gcc 13.3).
+
+### Releasing
+
+Push a `v*` tag and CI publishes a GitHub Release with the `.bin` and `.hex`:
+
+```bash
+git tag -a v1.2.0 -m "v1.2.0"
+git push origin v1.2.0          # tags do NOT go with a plain `git push`
+```
+
+### Things that will trip you up
+
+- **The headless builder's exit code is meaningless.** It exits 1 on a perfectly
+  good build, printing only its own launcher arguments, with no compile log and
+  an empty CDT error log. The pipeline therefore ignores the exit code and gates
+  on whether a fresh `Debug/NUCLEO-STOCK-TICKER.elf` exists, removing `Debug/`
+  first so a stale artifact cannot fake a pass. This has caught two real failures
+  that the exit code reported as success.
+- **Eclipse workspaces are bound to absolute paths.** CubeIDE records the
+  project's path inside its workspace metadata, so a workspace shared between
+  jobs keeps pointing at whichever path imported first — and then builds nothing,
+  silently. The workspace is scoped per job/branch and wiped before each build.
+- **The Debug config emits no `.bin` or `.hex`**, only `.elf`/`.list`/`.map`.
+  Those are produced by an `objcopy` stage, whose path is resolved with `find`
+  rather than hardcoded, because CubeIDE pins the toolchain inside a
+  version-stamped plugin directory that moves on every IDE update.
+- **`Core/Inc/app/secrets.h` is gitignored, so a clean clone cannot compile.** CI
+  copies `Core/Inc/app/secrets.h.example` into place. That proves the code
+  compiles; the artifact carries placeholder values.
+- **This repo cannot be cloned into a deep path on Windows.** A normal clone
+  silently produces an empty index with every file reported deleted — a MAX_PATH
+  failure, since the deepest path here is 102 characters. Workaround:
+  `git clone --no-checkout` then `git sparse-checkout init --cone` and
+  `git sparse-checkout set` with no directories, which checks out root-level
+  files only. Linux clones all 1,812 files without complaint.
+- **Multibranch is required, not preferred.** Jenkins polls with
+  `git ls-remote -h`, which lists heads only and cannot see tags.
