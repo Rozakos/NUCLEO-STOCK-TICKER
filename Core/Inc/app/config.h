@@ -40,7 +40,7 @@
 
 /* ---- TLS ---------------------------------------------------------------- */
 /* 1 = skip server-cert verification (INSECURE, bring-up only).
- * 0 = verify against the pinned CA in tls_ca_cert.c (preferred). */
+ * 0 = verify against the root CAs in app/tls_ca_cert_data.h (preferred). */
 #define TLS_INSECURE_SKIP_VERIFY  0
 
 /* ---- Console ------------------------------------------------------------ */

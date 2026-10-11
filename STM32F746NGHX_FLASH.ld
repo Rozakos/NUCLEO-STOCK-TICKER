@@ -178,6 +178,17 @@ SECTIONS
     __bss_end__ = _ebss;
   } >RAM
 
+  /* Not zeroed or loaded at startup, so it survives a reset: the fault
+     handler / watchdog leave the crash record here for the next boot
+     (app/watchdog.c). */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
+  } >RAM
+
   /* Ethernet DMA descriptors (GCC). ethernetif.c places DMARxDscrTab /
      DMATxDscrTab into these sections. Fixed at 0x2004C000 (ETHRAM) and
      covered by an MPU device region so they stay coherent with the ETH DMA

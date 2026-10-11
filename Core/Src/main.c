@@ -34,6 +34,7 @@
 #include "app/settings.h"
 #include "app/ui_task.h"
 #include "app/web_task.h"
+#include "app/watchdog.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -1668,6 +1669,7 @@ void StartDefaultTask(void const * argument)
   MX_LWIP_Init();
   /* USER CODE BEGIN 5 */
   printf("\r\n[boot] NUCLEO-STOCK-TICKER: LwIP up, starting app tasks\r\n");
+  watchdog_report_reset_cause();
 
   /* Start the UI before network logging can contend for the UART console.
    * Priority must NOT exceed the LwIP tcpip_thread/netTask (both Normal):
@@ -1705,10 +1707,13 @@ void StartDefaultTask(void const * argument)
    * of the network - it is most useful exactly when there is no link. */
   bt_console_start();
 
-  /* Infinite loop */
+  /* Supervisor: feeds the hardware watchdog only while the UI and network
+   * loops keep checking in (app/watchdog.c). */
+  watchdog_start();
   for(;;)
   {
-    osDelay(1);
+    watchdog_service();
+    osDelay(500);
   }
   /* USER CODE END 5 */
 }

@@ -129,7 +129,11 @@ Porting [Rozakos/CYD-Stock-Ticker](https://github.com/Rozakos/CYD-Stock-Ticker) 
       `http://<board-ip>/`. Settings persist through `ticker.cfg` on SD when a formatted
       card is available, else the flash sector-7 blob (this board has no SD card).
 - [x] **TLS verification**: `rozakos.eu` hostname and certificate chain are verified against
-      the pinned Google Trust Services WE1 intermediate (valid through 2029-02-20).
+      root CAs (GTS R1/R4, ISRG X1/X2) in `tls_ca_cert_data.h`. Until 2026-10-11 only the
+      GTS WE1 intermediate was pinned, which would have broken on Cloudflare's next renewal
+      if it came from Let's Encrypt or another GTS intermediate (rozakos.eu cert expires
+      2026-11-23). Verified with the vendored mbedTLS 2.16.2 + this board's config on the
+      host against rozakos.eu, Let's Encrypt YR1/YE1 chains and Google WE2.
 - [x] **Extended-hours 1D chart + session views (2026-07-09)**: 1d history fetched with
       `prepost=1`; snapshot carries `window_open`/`window_close`/`prev_close`. The
       progressive 1D axis spans the extended window, faint dividers mark the regular
@@ -358,6 +362,33 @@ line of `above|below` pairs; older firmware ignores the unknown key.
 and Bluetooth), FatFs is reentrant but `HAL_FLASH_*` is not.
 
 ## 10. Session log
+
+- **2026-10-11 — Claude (Opus 5.5, Claude Code):** Review fixes, **built but not
+  flashed** (arm-none-eabi-gcc 14.2 reproduction of the Debug config: 726/726 files,
+  links, 724 KB of the 768 KB flash cap).
+  (1) **TLS trust**: `tls_ca_cert_data.h` now holds GTS Root R1/R4 + ISRG Root X1/X2
+  instead of the single WE1 intermediate (GlobalSign Root CA left out: SHA-1 signed,
+  this mbedTLS has no SHA-1 and would refuse to parse it). The loader treats a partial
+  parse (positive return) as success — before, one bad cert disabled HTTPS entirely.
+  (2) **Runtime API token**: web admin "API Token" form (`POST /token`), stored in
+  settings (flash blob v3 "STK3", loads v1/v2 and upgrades; SD `token=` line); empty =
+  `STOCK_API_TOKEN`. Never echoed back, only the last 4 chars. Token changes don't bump
+  `generation` (that would blank the quotes).
+  (3) **Optional admin password**: `ADMIN_PASSWORD` in `secrets.h` (default "" = open,
+  older secrets.h still compile) -> HTTP Basic, user `admin`, 401 otherwise.
+  (4) **Deferred saves**: `settings_save()` only marks dirty; `settings_flush_pending()`
+  in the web task loop writes 2 s after the last change, so the sector erase no longer
+  happens inside a request and a burst of edits costs one erase.
+  (5) **Faults/watchdog**: new `app/fault.c` + `app/watchdog.{c,h}`. The generated
+  handlers in `stm32f7xx_it.c` branch (USER CODE blocks, `b`, not `bl`, so LR keeps
+  EXC_RETURN) to naked captures that dump PC/LR/CFSR/HFSR/MMFAR/BFAR over raw USART1
+  registers (the HAL lock may be held) and reset. Stack-overflow and malloc-failed
+  hooks do the same. IWDG 16 s, fed by the default task only while the UI loop (15 s)
+  and net loop (240 s) check in; debugger halt freezes it. Crash record lives in a new
+  `.noinit` section (both .ld files) and is printed at boot ("[boot] last reset: ...")
+  and shown on the web page. (6) Web page no longer claims settings reset on reboot.
+  **On-target TODO**: confirm `[watchdog] armed`, a deliberate fault (e.g. write to
+  0xFFFFFFF0 from the BT console) prints and resets, and token/password forms work.
 
 - **2026-07-31 — Claude (Opus 5, Claude Code):** Added Bluetooth via an HC-05
   on UART7 (user request, same session as the ESP-01 work below). **Code

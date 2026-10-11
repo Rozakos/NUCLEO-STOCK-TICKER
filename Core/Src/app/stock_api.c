@@ -19,6 +19,7 @@
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
 
+#include "app/settings.h"
 #include "app/tls_ca_cert_data.h"
 
 #define TLS_HEAP_ADDR       ((unsigned char *)0xC0040000U)
@@ -195,7 +196,7 @@ static int tls_stack_init(char *error, size_t error_size)
 #else
   if (!ca_initialized)
   {
-    snprintf(error, error_size, "pinned CA unavailable");
+    snprintf(error, error_size, "trusted CA bundle unavailable");
     return -1;
   }
   mbedtls_ssl_conf_ca_chain(&tls_config, &ca_cert, NULL);
@@ -306,6 +307,12 @@ static const char *find_header(const char *headers, const char *name)
 static int do_https_request(const char *path, char **body, size_t *body_len,
                             char *error, size_t error_size)
 {
+  /* Runtime token from the web admin wins; secrets.h is the fallback. */
+  char token[APP_API_TOKEN_LENGTH];
+  if (settings_get_api_token(token, sizeof(token)) == 0U)
+  {
+    snprintf(token, sizeof(token), "%s", STOCK_API_TOKEN);
+  }
   char request[768];
   int request_len = snprintf(request, sizeof(request),
       "GET %s HTTP/1.1\r\n"
@@ -315,7 +322,7 @@ static int do_https_request(const char *path, char **body, size_t *body_len,
       "Accept-Encoding: identity\r\n"
       "Authorization: Bearer %s\r\n"
       "Connection: keep-alive\r\n\r\n",
-      path, STOCK_API_HOST, STOCK_API_TOKEN);
+      path, STOCK_API_HOST, token);
   if (request_len <= 0 || (size_t)request_len >= sizeof(request))
   {
     snprintf(error, error_size, "request too large");
@@ -524,16 +531,31 @@ void stock_api_init(void)
 
   mbedtls_memory_buffer_alloc_init(TLS_HEAP_ADDR, TLS_HEAP_SIZE);
   mbedtls_x509_crt_init(&ca_cert);
+  /* A positive return means that many certificates in the bundle failed to
+   * parse while the rest loaded; verification still works with the others,
+   * so only a negative return or an empty chain disables HTTPS. */
   int ret = mbedtls_x509_crt_parse(&ca_cert,
       (const unsigned char *)tls_ca_cert_pem, strlen(tls_ca_cert_pem) + 1U);
-  if (ret == 0)
+  unsigned anchors = 0;
+  for (const mbedtls_x509_crt *crt = &ca_cert; crt != NULL && crt->version != 0;
+       crt = crt->next)
+  {
+    ++anchors;
+  }
+  if (ret >= 0 && anchors > 0U)
   {
     ca_initialized = true;
-    printf("[tls] pinned CA loaded; verification required\r\n");
+    printf("[tls] %u trusted root CAs loaded; verification required\r\n",
+           anchors);
+    if (ret > 0)
+    {
+      printf("[tls] WARNING: %d root CA(s) in the bundle failed to parse\r\n",
+             ret);
+    }
   }
   else
   {
-    printf("[tls] pinned CA parse failed: -0x%04X\r\n", (unsigned)-ret);
+    printf("[tls] CA bundle parse failed: -0x%04X\r\n", (unsigned)-ret);
   }
   cJSON_Hooks hooks = { .malloc_fn = json_malloc, .free_fn = json_free };
   cJSON_InitHooks(&hooks);

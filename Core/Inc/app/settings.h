@@ -7,6 +7,8 @@
 
 #define APP_MAX_SYMBOLS 8U
 #define APP_SYMBOL_LENGTH 12U
+/* Runtime API bearer token incl. NUL (stock-api master or per-device key). */
+#define APP_API_TOKEN_LENGTH 128U
 
 void settings_init(void);
 void settings_storage_load(void);
@@ -28,5 +30,12 @@ bool settings_set_alerts_csv(const char *csv);
 uint32_t settings_get_refresh_seconds(void);
 bool settings_set_refresh_seconds(uint32_t seconds);
 uint32_t settings_generation(void);
+/* Runtime API token; "" means "use STOCK_API_TOKEN from secrets.h".
+ * Set from the web admin, persisted with the other settings. */
+size_t settings_get_api_token(char *out, size_t capacity);
+bool settings_set_api_token(const char *token);
+/* Mutations are saved ~2 s after the last change, from the web task loop
+ * (one flash erase for a burst of edits, never inside an HTTP request). */
+void settings_flush_pending(void);
 
 #endif /* APP_SETTINGS_H */

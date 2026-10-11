@@ -12,7 +12,7 @@ display, **Ethernet + WiFi** networking and a **Bluetooth** console.
 | UI | LVGL 9.x | LVGL 9.x |
 | Net | WiFi | **Ethernet** (LAN8742A RMII) + LwIP, **WiFi** via ESP-01 as fallback |
 | Bluetooth | — | **HC-05** SPP console, log mirror and price alerts |
-| TLS | (ESP) | mbedTLS (pinned CA, session resumption, keep-alive) |
+| TLS | (ESP) | mbedTLS (root-CA verification, session resumption, keep-alive) |
 | JSON | ArduinoJson | cJSON |
 | Data | self-hosted yfinance proxy (`rozakos.eu/stocks/api/v1`, bearer token) | same |
 
@@ -43,7 +43,7 @@ display, **Ethernet + WiFi** networking and a **Bluetooth** console.
   lease; an **ESP-01** on USART6 provides WiFi as an automatic fallback. Both sit
   behind one TCP abstraction (`app/net_link.h`), so the HTTPS client *and* the web
   admin work over either — unplug the cable and quotes keep arriving. TLS always
-  runs on the STM32, so the pinned CA and session resumption are unaffected by
+  runs on the STM32, so certificate checks and session resumption are unaffected by
   which link is carrying traffic. (The ESP-01 is a socket provider, not an LwIP
   netif: stock AT firmware has no PPP/SLIP server.)
 - **Bluetooth console** via an **HC-05** on UART7: pair from a phone with any SPP
@@ -56,11 +56,23 @@ display, **Ethernet + WiFi** networking and a **Bluetooth** console.
 - **Debug log over Bluetooth**: the `printf` console is mirrored to the HC-05 so
   logs can be watched without the ST-Link cable (`log on|off` to toggle).
 - **Web admin** at `http://<board-ip>/`: add/delete symbols, shares owned,
-  refresh interval, price alert thresholds.
+  refresh interval, price alert thresholds, and the **API token** (paste a
+  per-device key from the stock-api page; no reflash). Optional login: set
+  `ADMIN_PASSWORD` in `secrets.h` and the page asks for user `admin`.
+- **HTTPS verified against root CAs**: the trust store holds the roots behind
+  Cloudflare's Universal SSL (Google GTS R1/R4, Let's Encrypt ISRG X1/X2), so a
+  certificate renewal from a different CA or intermediate doesn't break the ticker.
+- **Crash and hang recovery**: a HardFault/MemManage/BusFault/UsageFault, stack
+  overflow or failed allocation prints PC/LR and the fault registers on the
+  console and resets; a hardware watchdog (16 s) resets the board if the UI or
+  network loop stops checking in. The next boot prints the reason (and the web
+  admin shows "Last reset: …") so a crash is never silent.
 - **Persistent settings**: saved to a microSD card (`ticker.cfg`) when present,
   otherwise to **internal flash sector 7** (0x080C0000) — watchlist, shares and
-  refresh interval survive power cycles with no SD card. Note: a flash save stalls
-  the CPU ~1 s (sector erase, single-bank XIP); unchanged saves are skipped.
+  refresh interval survive power cycles with no SD card. Saves happen ~2 s after
+  the last change (one sector erase for a burst of edits, never in the middle of
+  a web request): a flash save stalls the CPU ~1 s (single-bank XIP); unchanged
+  saves are skipped.
 - **Tear-free display**: double-buffered SDRAM framebuffers; buffer swaps are queued
   in the LTDC shadow registers and applied by hardware in vertical blanking.
 - Status bar: hand-drawn ethernet jack and WiFi icons — whichever link is carrying

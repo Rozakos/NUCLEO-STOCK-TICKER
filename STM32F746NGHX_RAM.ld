@@ -165,6 +165,17 @@ SECTIONS
     __bss_end__ = _ebss;
   } >RAM
 
+  /* Not zeroed or loaded at startup, so it survives a reset: the fault
+     handler / watchdog leave the crash record here for the next boot
+     (app/watchdog.c). */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
+  } >RAM
+
   /* User_heap_stack section, used to check that there is enough "RAM" Ram  type memory left */
   ._user_heap_stack :
   {

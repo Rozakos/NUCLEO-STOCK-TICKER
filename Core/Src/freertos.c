@@ -25,6 +25,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include "app/watchdog.h"
 
 /* USER CODE END Includes */
 
@@ -80,24 +81,17 @@ __weak void vApplicationIdleHook( void )
 __weak void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
 {
   (void)xTask;
-  printf("\r\n[fatal] stack overflow: %s\r\n",
-         pcTaskName != NULL ? (char *)pcTaskName : "unknown");
-  taskDISABLE_INTERRUPTS();
-  for (;;)
-  {
-  }
+  /* printf here was swallowed (the UART HAL lock is usually held), so a
+   * stack overflow looked like silent death. Raw-UART dump + reset instead. */
+  fault_record_and_reset("StackOverflow",
+                         0U, 0U, pcTaskName != NULL ? (char *)pcTaskName : "?");
 }
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN 5 */
 __weak void vApplicationMallocFailedHook(void)
 {
-  printf("\r\n[fatal] FreeRTOS malloc failed; free heap: %lu\r\n",
-         (unsigned long)xPortGetFreeHeapSize());
-  taskDISABLE_INTERRUPTS();
-  for (;;)
-  {
-  }
+  fault_record_and_reset("MallocFailed", 0U, 0U, "FreeRTOS heap");
 }
 /* USER CODE END 5 */
 

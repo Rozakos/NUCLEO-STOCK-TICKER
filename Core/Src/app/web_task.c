@@ -3,12 +3,23 @@
 #include "app/net_link.h"
 #include "app/settings.h"
 #include "app/stock_data.h"
+#include "app/watchdog.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "cmsis_os.h"
+#include "mbedtls/base64.h"
+
+/* Optional admin password (secrets.h). Empty = open admin page, as before.
+ * When set, every request needs HTTP Basic auth as user "admin". It is only
+ * a LAN speed bump (plain HTTP), but it stops anyone else on the network --
+ * or a web page you visit -- from changing the watchlist or API token. */
+#ifndef ADMIN_PASSWORD
+#define ADMIN_PASSWORD ""
+#endif
 
 #define WEB_BUFFER_ADDR ((char *)0xC0068000U)
 #define WEB_BUFFER_SIZE (20U * 1024U)
@@ -146,11 +157,34 @@ static size_t append_symbols_page(char *buffer)
     "<h2>Settings</h2><form class=add method=POST action=/settings>"
     "<input name=refresh_s type=number min=15 max=3600 value=%lu required>"
     "<button type=submit>Save refresh</button></form>"
-    "<p class=muted>Seconds between quote refreshes. Up to %u symbols. "
-    "Settings apply immediately but reset to firmware defaults after reboot.</p>"
-    "</body></html>",
+    "<p class=muted>Seconds between quote refreshes. Up to %u symbols.</p>",
     (unsigned long)settings_get_refresh_seconds(), APP_MAX_SYMBOLS);
   used = append(buffer, used, form);
+
+  /* API token: never echoed back, only whether a custom one is in use. */
+  char token[APP_API_TOKEN_LENGTH];
+  size_t token_length = settings_get_api_token(token, sizeof(token));
+  char token_form[900];
+  snprintf(token_form, sizeof(token_form),
+    "<h2>API Token</h2><form class=add method=POST action=/token>"
+    "<input name=token type=password autocomplete=off placeholder='new bearer token' maxlength=%u>"
+    "<button type=submit>Save</button></form>"
+    "<p class=muted>%s%s%s Paste a per-device key from the stock-api page; "
+    "save an empty field to go back to the firmware's built-in token.</p>",
+    (unsigned)(APP_API_TOKEN_LENGTH - 1U),
+    token_length > 0U ? "Using a custom token ending in <strong>&hellip;" :
+                        "Using the token built into the firmware.",
+    token_length > 0U ? token + (token_length > 4U ? token_length - 4U : 0U) : "",
+    token_length > 0U ? "</strong>." : "");
+  used = append(buffer, used, token_form);
+  used = append(buffer, used,
+    "<p class=muted>Changes apply immediately and are saved to the SD card "
+    "(or internal flash) a couple of seconds later, so they survive a reboot.</p>");
+  char reset_line[160];
+  snprintf(reset_line, sizeof(reset_line),
+           "<p class=muted>Last reset: %s</p></body></html>",
+           watchdog_last_reset_text());
+  used = append(buffer, used, reset_line);
   buffer[used] = '\0';
   return used;
 }
@@ -248,11 +282,57 @@ static char *form_value(char *request, const char *name)
   return NULL;
 }
 
+/* True when no password is configured or the request carries the right
+ * "Authorization: Basic base64(admin:<password>)" header. */
+static bool authorized(const char *request)
+{
+  static char expected[96];
+  if (ADMIN_PASSWORD[0] == '\0') return true;
+  if (expected[0] == '\0')
+  {
+    char plain[72];
+    int plain_length = snprintf(plain, sizeof(plain), "admin:%s", ADMIN_PASSWORD);
+    size_t written = 0;
+    if (plain_length <= 0 || (size_t)plain_length >= sizeof(plain) ||
+        mbedtls_base64_encode((unsigned char *)expected, sizeof(expected) - 1U,
+                              &written, (const unsigned char *)plain,
+                              (size_t)plain_length) != 0)
+    {
+      return false;   /* misconfigured (too long): fail closed */
+    }
+    expected[written] = '\0';
+  }
+  const char *end = strstr(request, "\r\n\r\n");
+  for (const char *line = strstr(request, "\r\n"); line != NULL && line < end;
+       line = strstr(line + 2, "\r\n"))
+  {
+    if (strncasecmp(line + 2, "Authorization: Basic ", 21) == 0)
+    {
+      const char *value = line + 23;
+      size_t length = strlen(expected);
+      return strncmp(value, expected, length) == 0 &&
+             (value[length] == '\r' || value[length] == ' ');
+    }
+  }
+  return false;
+}
+
 static void handle_client(net_conn_t *client)
 {
   char request[1536];
   int received = receive_request(client, request, sizeof(request));
   if (received <= 0) return;
+
+  if (!authorized(request))
+  {
+    static const char denied[] =
+        "HTTP/1.1 401 Unauthorized\r\n"
+        "WWW-Authenticate: Basic realm=\"Stock Ticker\", charset=\"UTF-8\"\r\n"
+        "Content-Type: text/plain\r\nContent-Length: 14\r\n"
+        "Connection: close\r\n\r\nLogin required";
+    send_all(client, denied, sizeof(denied) - 1U);
+    return;
+  }
 
   if (strncmp(request, "POST /add ", 10) == 0)
   {
@@ -292,6 +372,11 @@ static void handle_client(net_conn_t *client)
                          below != NULL ? strtof(below, NULL) : 0.0f);
     }
   }
+  else if (strncmp(request, "POST /token ", 12) == 0)
+  {
+    char *token = form_value(request, "token");
+    if (token != NULL) settings_set_api_token(token);
+  }
   else if (strncmp(request, "POST /settings ", 15) == 0)
   {
     char *refresh = form_value(request, "refresh_s");
@@ -321,6 +406,7 @@ void StartWebTask(void const *argument)
 
   for (;;)
   {
+    settings_flush_pending();   /* deferred saves; this loop wakes at least 1/s */
     net_link_kind_t active = net_link_active();
 
     /* The listener belongs to one link. When Ethernet comes or goes we tear

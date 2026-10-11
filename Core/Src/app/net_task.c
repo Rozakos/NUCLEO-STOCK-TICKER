@@ -7,6 +7,7 @@
 #include "app/settings.h"
 #include "app/stock_api.h"
 #include "app/stock_data.h"
+#include "app/watchdog.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -19,6 +20,7 @@ static void wait_for_refresh_or_settings(uint32_t delay_ms,
          settings_generation() == settings_seen &&
          !history_data_request_pending())
   {
+    watchdog_checkin(WATCHDOG_NET);
     osDelay(250);
   }
 }
@@ -29,6 +31,7 @@ static void net_wait_for_ip(void)
   net_link_kind_t kind = NET_LINK_NONE;
   while (kind == NET_LINK_NONE)
   {
+    watchdog_checkin(WATCHDOG_NET);   /* no cable is not a hang */
     /* Ethernet normally wins the race; WiFi association takes ~10 s, so
      * this usually returns as soon as DHCP binds on the wire. */
     kind = net_link_wait_ready(30000U);
@@ -54,6 +57,7 @@ void StartNetTask(void const *argument)
 
   for (;;)
   {
+    watchdog_checkin(WATCHDOG_NET);
     history_request_t history_request;
     if (history_data_take_request(&history_request))
     {
@@ -141,6 +145,7 @@ void StartNetTask(void const *argument)
     for (size_t i = 0; i < symbol_count; ++i)
     {
       const char *symbol = symbols[i];
+      watchdog_checkin(WATCHDOG_NET);
       if (history_data_request_pending()) break;
       if (strcmp(symbol, "AMD") == 0 || !logo_cache_should_fetch(symbol))
       {

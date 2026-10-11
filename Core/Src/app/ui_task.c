@@ -16,6 +16,7 @@
 
 #include "cmsis_os.h"
 #include "lvgl.h"
+#include "app/watchdog.h"
 #include "main.h"
 
 #define FRAMEBUFFER_SIZE (LCD_WIDTH * LCD_HEIGHT * 2U)
@@ -1867,6 +1868,7 @@ void StartUiTask(void const *argument)
   uint32_t last_update = 0;
   for (;;)
   {
+    watchdog_checkin(WATCHDOG_UI);
     if (settings_generation() != settings_seen) rebuild_rows();
     if (HAL_GetTick() - last_update >= 500U)
     {

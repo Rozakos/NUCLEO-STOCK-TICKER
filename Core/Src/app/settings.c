@@ -26,7 +26,16 @@ static float current_alert_below[APP_MAX_SYMBOLS];
 static size_t current_count;
 static uint32_t generation;
 static uint32_t refresh_seconds;
+/* Runtime API bearer token ("" = use STOCK_API_TOKEN from secrets.h). */
+static char current_api_token[APP_API_TOKEN_LENGTH];
 static bool storage_ready;
+/* Saves are deferred: a mutation marks the settings dirty and the web task's
+ * loop writes them SETTINGS_SAVE_DELAY_MS later (settings_flush_pending()).
+ * Several edits in a row then cost one flash erase instead of one each, and
+ * the ~1 s erase stall no longer happens while a browser waits for a reply. */
+#define SETTINGS_SAVE_DELAY_MS 2000U
+static volatile bool save_pending;
+static volatile uint32_t save_due_tick;
 static bool sd_ready;
 
 /* ---- Internal-flash store ------------------------------------------------
@@ -35,7 +44,8 @@ static bool sd_ready;
  * A sector erase stalls the CPU for ~1 s (single-bank XIP), so saves skip
  * rewriting when the blob is unchanged. */
 #define SETTINGS_FLASH_ADDR  0x080C0000U
-#define SETTINGS_FLASH_MAGIC 0x53544B32U   /* "STK2": v1 + alert thresholds */
+#define SETTINGS_FLASH_MAGIC 0x53544B33U   /* "STK3": v2 + runtime API token */
+#define SETTINGS_FLASH_MAGIC_V2 0x53544B32U   /* "STK2": v1 + alert thresholds */
 #define SETTINGS_FLASH_MAGIC_V1 0x53544B31U
 
 typedef struct
@@ -47,8 +57,22 @@ typedef struct
   float shares[APP_MAX_SYMBOLS];
   float alert_above[APP_MAX_SYMBOLS];
   float alert_below[APP_MAX_SYMBOLS];
+  char api_token[APP_API_TOKEN_LENGTH];
   uint32_t checksum;
 } settings_blob_t;
+
+/* The pre-token layout (alerts, no token). Same upgrade story as v1. */
+typedef struct
+{
+  uint32_t magic;
+  uint32_t refresh;
+  uint32_t count;
+  char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
+  float shares[APP_MAX_SYMBOLS];
+  float alert_above[APP_MAX_SYMBOLS];
+  float alert_below[APP_MAX_SYMBOLS];
+  uint32_t checksum;
+} settings_blob_v2_t;
 
 /* The pre-alerts layout. Adding fields moved `checksum`, so a v1 blob fails
  * the v2 check; without this the first boot after upgrading would silently
@@ -89,6 +113,7 @@ static void flash_save(void)
   memcpy(blob.shares, current_shares, sizeof(blob.shares));
   memcpy(blob.alert_above, current_alert_above, sizeof(blob.alert_above));
   memcpy(blob.alert_below, current_alert_below, sizeof(blob.alert_below));
+  memcpy(blob.api_token, current_api_token, sizeof(blob.api_token));
   taskEXIT_CRITICAL();
   blob.checksum = blob_checksum(&blob, offsetof(settings_blob_t, checksum));
 
@@ -156,46 +181,69 @@ static bool flash_load_v1(void)
   return true;
 }
 
-static bool flash_load(void)
+/* Apply a v2/v3 blob's common fields. `token` may be NULL (v2). */
+static void apply_blob(uint32_t count, uint32_t refresh,
+                       const char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH],
+                       const float *shares, const float *above,
+                       const float *below, const char *token)
 {
-  const settings_blob_t *blob = (const settings_blob_t *)SETTINGS_FLASH_ADDR;
-
-  if (blob->magic == SETTINGS_FLASH_MAGIC_V1)
-  {
-    if (flash_load_v1()) return true;
-    printf("[settings] no flash config; using defaults\r\n");
-    return false;
-  }
-
-  if (blob->magic != SETTINGS_FLASH_MAGIC || blob->count == 0U ||
-      blob->count > APP_MAX_SYMBOLS ||
-      blob->checksum != blob_checksum(blob,
-                                      offsetof(settings_blob_t, checksum)))
-  {
-    printf("[settings] no flash config; using defaults\r\n");
-    return false;
-  }
-
   taskENTER_CRITICAL();
-  current_count = blob->count;
-  memcpy(current_symbols, blob->symbols, sizeof(current_symbols));
+  current_count = count;
+  memcpy(current_symbols, symbols, sizeof(current_symbols));
   for (size_t i = 0; i < APP_MAX_SYMBOLS; ++i)
   {
     current_symbols[i][APP_SYMBOL_LENGTH - 1U] = '\0';
-    current_shares[i] = blob->shares[i] >= 0.0f ? blob->shares[i] : 0.0f;
-    current_alert_above[i] =
-        blob->alert_above[i] > 0.0f ? blob->alert_above[i] : 0.0f;
-    current_alert_below[i] =
-        blob->alert_below[i] > 0.0f ? blob->alert_below[i] : 0.0f;
+    current_shares[i] = shares[i] >= 0.0f ? shares[i] : 0.0f;
+    current_alert_above[i] = above[i] > 0.0f ? above[i] : 0.0f;
+    current_alert_below[i] = below[i] > 0.0f ? below[i] : 0.0f;
   }
-  if (blob->refresh >= 15U && blob->refresh <= 3600U)
+  if (token != NULL)
   {
-    refresh_seconds = blob->refresh;
+    memcpy(current_api_token, token, sizeof(current_api_token));
+    current_api_token[APP_API_TOKEN_LENGTH - 1U] = '\0';
+  }
+  if (refresh >= 15U && refresh <= 3600U)
+  {
+    refresh_seconds = refresh;
   }
   ++generation;
   taskEXIT_CRITICAL();
-  printf("[settings] loaded from flash\r\n");
-  return true;
+}
+
+static bool flash_load(void)
+{
+  const uint32_t magic = *(const uint32_t *)SETTINGS_FLASH_ADDR;
+
+  if (magic == SETTINGS_FLASH_MAGIC_V1)
+  {
+    if (flash_load_v1()) return true;
+  }
+  else if (magic == SETTINGS_FLASH_MAGIC_V2)
+  {
+    const settings_blob_v2_t *blob = (const settings_blob_v2_t *)SETTINGS_FLASH_ADDR;
+    if (blob->count != 0U && blob->count <= APP_MAX_SYMBOLS &&
+        blob->checksum == blob_checksum(blob, offsetof(settings_blob_v2_t, checksum)))
+    {
+      apply_blob(blob->count, blob->refresh, blob->symbols, blob->shares,
+                 blob->alert_above, blob->alert_below, NULL);
+      printf("[settings] loaded from flash (pre-token format, upgraded)\r\n");
+      return true;
+    }
+  }
+  else if (magic == SETTINGS_FLASH_MAGIC)
+  {
+    const settings_blob_t *blob = (const settings_blob_t *)SETTINGS_FLASH_ADDR;
+    if (blob->count != 0U && blob->count <= APP_MAX_SYMBOLS &&
+        blob->checksum == blob_checksum(blob, offsetof(settings_blob_t, checksum)))
+    {
+      apply_blob(blob->count, blob->refresh, blob->symbols, blob->shares,
+                 blob->alert_above, blob->alert_below, blob->api_token);
+      printf("[settings] loaded from flash\r\n");
+      return true;
+    }
+  }
+  printf("[settings] no flash config; using defaults\r\n");
+  return false;
 }
 
 static void settings_save_locked(void)
@@ -245,7 +293,10 @@ static void settings_save_locked(void)
     format_decimal_2(low, sizeof(low), below[i], 0);
     f_printf(&file, "%s%s|%s", i == 0U ? "" : ",", high, low);
   }
-  f_printf(&file, "\n");
+  /* token= is the runtime API key; absent or empty = firmware default. */
+  char token[APP_API_TOKEN_LENGTH];
+  settings_get_api_token(token, sizeof(token));
+  f_printf(&file, "\ntoken=%s\n", token);
   FRESULT result = f_sync(&file);
   if (f_close(&file) != FR_OK || result != FR_OK) return;
 
@@ -259,7 +310,14 @@ static void settings_save_locked(void)
 static void settings_save(void)
 {
   if (!storage_ready) return;
+  save_due_tick = osKernelSysTick() + SETTINGS_SAVE_DELAY_MS;
+  save_pending = true;
+}
 
+void settings_flush_pending(void)
+{
+  if (!save_pending || (int32_t)(osKernelSysTick() - save_due_tick) < 0) return;
+  save_pending = false;
   if (save_lock != NULL) osMutexWait(save_lock, osWaitForever);
   settings_save_locked();
   if (save_lock != NULL) osMutexRelease(save_lock);
@@ -331,6 +389,10 @@ void settings_storage_load(void)
         else if (strncmp(line, "refresh=", 8) == 0)
         {
           settings_set_refresh_seconds((uint32_t)strtoul(line + 8, NULL, 10));
+        }
+        else if (strncmp(line, "token=", 6) == 0)
+        {
+          settings_set_api_token(line + 6);
         }
       }
       f_close(&file);
@@ -619,4 +681,41 @@ uint32_t settings_generation(void)
   uint32_t result = generation;
   taskEXIT_CRITICAL();
   return result;
+}
+
+static bool valid_token_char(char value)
+{
+  return value > 0x20 && value < 0x7F;   /* printable ASCII, no spaces */
+}
+
+size_t settings_get_api_token(char *out, size_t capacity)
+{
+  if (out == NULL || capacity == 0U) return 0U;
+  taskENTER_CRITICAL();
+  size_t length = strnlen(current_api_token, sizeof(current_api_token) - 1U);
+  if (length > capacity - 1U) length = capacity - 1U;
+  memcpy(out, current_api_token, length);
+  taskEXIT_CRITICAL();
+  out[length] = '\0';
+  return length;
+}
+
+bool settings_set_api_token(const char *token)
+{
+  char parsed[APP_API_TOKEN_LENGTH] = { 0 };
+  size_t length = 0;
+  for (; token != NULL && *token != '\0'; ++token)
+  {
+    if (*token == ' ' || *token == '\r' || *token == '\n') continue;
+    if (length >= sizeof(parsed) - 1U || !valid_token_char(*token)) return false;
+    parsed[length++] = *token;
+  }
+  /* No ++generation: that tells the UI and net task the watchlist changed
+   * (rows rebuilt, quotes blanked). The next request just uses the token. */
+  taskENTER_CRITICAL();
+  bool changed = strcmp(current_api_token, parsed) != 0;
+  memcpy(current_api_token, parsed, sizeof(current_api_token));
+  taskEXIT_CRITICAL();
+  if (changed) settings_save();
+  return true;
 }
