@@ -1,4 +1,5 @@
 #include "app/web_task.h"
+#include "app/config.h"
 #include "app/format.h"
 #include "app/net_link.h"
 #include "app/settings.h"
@@ -12,6 +13,7 @@
 
 #include "cmsis_os.h"
 #include "mbedtls/base64.h"
+#include "stm32f7xx_hal.h"
 
 /* Optional admin password (secrets.h). Empty = open admin page, as before.
  * When set, every request needs HTTP Basic auth as user "admin". It is only
@@ -282,6 +284,97 @@ static char *form_value(char *request, const char *name)
   return NULL;
 }
 
+/* ---- Rozakos local device protocol --------------------------------------
+ * Read-only JSON for the Rozakos Home app (identity + live quotes), the same
+ * contract the ESP32 devices serve. Deliberately outside the admin password:
+ * it exposes nothing that isn't already on the screen. */
+static void send_json(net_conn_t *client, const char *body, size_t length)
+{
+  char header[160];
+  int header_length = snprintf(header, sizeof(header),
+      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+      "Content-Length: %u\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+      (unsigned)length);
+  send_all(client, header, (size_t)header_length);
+  send_all(client, body, length);
+}
+
+static void device_id(char *out, size_t size)
+{
+  uint32_t uid = HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2();
+  snprintf(out, size, "nucleo-ticker-%04lx", (unsigned long)((uid ^ (uid >> 16)) & 0xFFFFU));
+}
+
+static void send_api_info(net_conn_t *client)
+{
+  char id[24];
+  device_id(id, sizeof(id));
+  char *body = WEB_BUFFER_ADDR;
+  int length = snprintf(body, WEB_BUFFER_SIZE,
+      "{\"id\":\"%s\",\"name\":\"STM32 Stock Ticker\",\"type\":\"nucleo_stock_ticker\","
+      "\"fw\":\"%s\",\"webUiPath\":\"/\",\"capabilities\":[\"web_ui\",\"settings\",\"state\"]}",
+      id, APP_FW_VERSION);
+  send_json(client, body, (size_t)length);
+}
+
+static const char *session_name(stock_session_t session)
+{
+  switch (session)
+  {
+    case STOCK_SESSION_PRE:     return "PRE";
+    case STOCK_SESSION_REGULAR: return "REGULAR";
+    case STOCK_SESSION_POST:    return "POST";
+    case STOCK_SESSION_CLOSED:  return "CLOSED";
+    default:                    return NULL;
+  }
+}
+
+static void send_api_state(net_conn_t *client)
+{
+  char symbols[APP_MAX_SYMBOLS][APP_SYMBOL_LENGTH];
+  stock_snapshot_t stocks[APP_MAX_SYMBOLS];
+  size_t symbol_count = settings_get_symbols(symbols);
+  size_t stock_count = stock_data_get_all(stocks);
+  char *body = WEB_BUFFER_ADDR;
+  size_t used = append(body, 0, "{\"quotes\":[");
+  stock_session_t session = STOCK_SESSION_UNKNOWN;
+  for (size_t i = 0; i < symbol_count; ++i)
+  {
+    const stock_snapshot_t *found = NULL;
+    for (size_t j = 0; j < stock_count; ++j)
+    {
+      if (strcmp(symbols[i], stocks[j].symbol) == 0) found = &stocks[j];
+    }
+    char item[200];
+    if (found != NULL && found->fresh)
+    {
+      char price[20], change[20];
+      format_decimal_2(price, sizeof(price), found->last, 0);
+      format_decimal_2(change, sizeof(change), found->change_pct, 0);
+      snprintf(item, sizeof(item), "%s{\"symbol\":\"%s\",\"price\":%s,\"change_pct\":%s,\"fresh\":true}",
+               i == 0 ? "" : ",", symbols[i], price, change);
+      if (found->session != STOCK_SESSION_UNKNOWN) session = found->session;
+    }
+    else
+    {
+      snprintf(item, sizeof(item), "%s{\"symbol\":\"%s\",\"price\":null,\"change_pct\":null,\"fresh\":false}",
+               i == 0 ? "" : ",", symbols[i]);
+    }
+    used = append(body, used, item);
+  }
+  used = append(body, used, "]");
+  const char *market = session_name(session);
+  if (market != NULL)
+  {
+    char tail[40];
+    snprintf(tail, sizeof(tail), ",\"market_state\":\"%s\"", market);
+    used = append(body, used, tail);
+  }
+  used = append(body, used, "}");
+  body[used] = '\0';
+  send_json(client, body, used);
+}
+
 /* True when no password is configured or the request carries the right
  * "Authorization: Basic base64(admin:<password>)" header. */
 static bool authorized(const char *request)
@@ -322,6 +415,17 @@ static void handle_client(net_conn_t *client)
   char request[1536];
   int received = receive_request(client, request, sizeof(request));
   if (received <= 0) return;
+
+  if (strncmp(request, "GET /api/device-info ", 21) == 0)
+  {
+    send_api_info(client);
+    return;
+  }
+  if (strncmp(request, "GET /api/state ", 15) == 0)
+  {
+    send_api_state(client);
+    return;
+  }
 
   if (!authorized(request))
   {

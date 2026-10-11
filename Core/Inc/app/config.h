@@ -9,6 +9,9 @@
 
 #include "app/secrets.h"
 
+/* Firmware version reported to the Rozakos Home app (GET /api/device-info). */
+#define APP_FW_VERSION        "1.1.0"
+
 /* ---- Display (onboard RK043FN48H-CT672B panel) ------------------------- */
 #define LCD_WIDTH             480
 #define LCD_HEIGHT            272
